@@ -89,6 +89,60 @@ static int coin_frames;
 static int boot_player_side=1,boot_resolution;static unsigned active_w,active_h;   /* what this run started with */
 
 static struct Eye { XrSwapchain chain;uint32_t w,h,n;QSwapchainImage *images;GLuint *fb,depth; } eyes[2];
+/* The pause menu as its own composition layer, under the game's picture: the headset draws it straight to the display, at the
+ * menu's own resolution, instead of from the eye image (on a Quest that is about half the menu's resolution, and resampled once
+ * more). The picture lets it through where the menu is (alpha 0) and covers it elsewhere, so the laser still crosses it. The
+ * menu is still drawn into the picture too: a desktop mirror, screenshots, and the fallback if the layer fails. */
+static struct MenuLayer { XrSwapchain chain;uint32_t n,mips;QSwapchainImage *images;GLuint *fb;unsigned version;bool ok; } menu_layer;
+static void menu_layer_close(void){
+    if(menu_layer.fb&&context&&gpu_ready)glDeleteFramebuffers(menu_layer.n,menu_layer.fb);
+    if(menu_layer.chain)xrDestroySwapchain(menu_layer.chain);
+    free(menu_layer.images);free(menu_layer.fb);memset(&menu_layer,0,sizeof menu_layer);
+}
+static void menu_layer_open(int64_t format){
+    const char *off=getenv("TCVR_MENU_LAYER");if(off&&!strcmp(off,"0"))return;
+    uint32_t mips=1;while((QMENU_W>>mips)>0||(QMENU_H>>mips)>0)mips++;
+    for(int attempt=0;attempt<2&&!menu_layer.chain;attempt++){   /* with smaller copies (no shimmer from afar), else without */
+        XrSwapchainCreateInfo cc={XR_TYPE_SWAPCHAIN_CREATE_INFO};cc.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+        cc.format=format;cc.sampleCount=1;cc.width=QMENU_W;cc.height=QMENU_H;cc.faceCount=1;cc.arraySize=1;cc.mipCount=attempt?1:mips;
+        if(XR_SUCCEEDED(xrCreateSwapchain(session,&cc,&menu_layer.chain)))menu_layer.mips=cc.mipCount;else menu_layer.chain=XR_NULL_HANDLE;
+    }
+    if(!menu_layer.chain||XR_FAILED(xrEnumerateSwapchainImages(menu_layer.chain,0,&menu_layer.n,NULL))||!menu_layer.n){
+        fprintf(stderr,"[XR] menu layer unavailable; the menu is drawn into the picture\n");menu_layer_close();return;
+    }
+    menu_layer.images=calloc(menu_layer.n,sizeof *menu_layer.images);menu_layer.fb=calloc(menu_layer.n,sizeof(GLuint));
+    if(!menu_layer.images||!menu_layer.fb){menu_layer_close();return;}
+    for(uint32_t j=0;j<menu_layer.n;j++)menu_layer.images[j].type=Q_SWAPCHAIN_IMAGE;
+    if(XR_FAILED(xrEnumerateSwapchainImages(menu_layer.chain,menu_layer.n,&menu_layer.n,(XrSwapchainImageBaseHeader*)menu_layer.images))){menu_layer_close();return;}
+    glGenFramebuffers(menu_layer.n,menu_layer.fb);
+    for(uint32_t j=0;j<menu_layer.n;j++){
+        glBindFramebuffer(GL_FRAMEBUFFER,menu_layer.fb[j]);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,menu_layer.images[j].image,0);
+        if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){glBindFramebuffer(GL_FRAMEBUFFER,0);menu_layer_close();return;}
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER,0);menu_layer.ok=true;
+    fprintf(stderr,"[XR] menu layer %dx%d, %u mip levels\n",QMENU_W,QMENU_H,menu_layer.mips);
+}
+/* Copies the menu into the layer's next image when it changed. False if that failed: the layer is dropped for good. */
+static bool menu_layer_update(void){
+    const unsigned version=qui_menu_version();
+    if(!version)return false;
+    if(version==menu_layer.version)return true;
+    uint32_t index;XrSwapchainImageAcquireInfo acq={XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    XrSwapchainImageWaitInfo wait={XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
+    if(XR_FAILED(xrAcquireSwapchainImage(menu_layer.chain,&acq,&index))||XR_FAILED(xrWaitSwapchainImage(menu_layer.chain,&wait))){
+        fprintf(stderr,"[XR] menu layer failed; the menu is drawn into the picture\n");menu_layer.ok=false;return false;
+    }
+    GLint fb;glGetIntegerv(GL_FRAMEBUFFER_BINDING,&fb);
+    glBindFramebuffer(GL_FRAMEBUFFER,menu_layer.fb[index]);glViewport(0,0,QMENU_W,QMENU_H);qui_copy_menu();
+    if(menu_layer.mips>1){
+        GLint bound;glGetIntegerv(GL_TEXTURE_BINDING_2D,&bound);glBindTexture(GL_TEXTURE_2D,menu_layer.images[index].image);
+        glGenerateMipmap(GL_TEXTURE_2D);glBindTexture(GL_TEXTURE_2D,bound);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER,fb);
+    XrSwapchainImageReleaseInfo rel={XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    if(XR_FAILED(xrReleaseSwapchainImage(menu_layer.chain,&rel))){menu_layer.ok=false;return false;}
+    menu_layer.version=version;return true;
+}
 static double profile_parts[6],profile_thread;
 static double cpu_ms(void){
 #ifdef TCVR_PC
@@ -175,11 +229,49 @@ static void reset_menu_input(void){
     kb_nav_x=kb_nav_y=kb_tab=0;kb_select=kb_back=false;
 }
 /* Opens (on a tab, or -1: the last one) or closes the menu. */
+/* The game's sound: silent while the menu holds an offline game or the headset app is in the background, else the player's
+ * volume (AUDIO tab). Voice chat is mixed in after it and keeps its own volume. */
+static bool skipping;
+static void apply_game_volume(void){
+    bool silent=skipping||(paused&&!tc2_online_session());
+#ifdef TCVR_PC
+    if(!desktop)
+#endif
+    if(!focused)silent=true;
+    tc2_audio_volume(silent?0:options.game_volume);
+}
 static void set_paused(bool p,int tab){
     if(p&&(!paused||tab>=0))qmenu_open(tab);
     if(p&&!paused)menu_placed=false;
     paused=p;reset_fire_input();reset_menu_input();game_deadline=0;
-    tc2_audio_volume(paused&&!tc2_online_session()?0:100);ss22_input_neutral();
+    apply_game_volume();ss22_input_neutral();
+}
+/* SKIPPING THE START-UP (PLAYER tab, off by default): a shot during the arcade's own start-up (tc2_online_startup_left: after power-on the memory test, the link
+ * countdown, the parental advisory and the logo; after a TEST restart the last two) runs the arcade as fast as the device allows to
+ * its end, silent. The arcade runs the same frames with the same inputs, only sooner. The menu or the app losing focus stops it. */
+static bool skip_test;                    /* the test script's "skip": the shot, without a hand on the trigger */
+static int skip_left;static Uint64 skip_started,skip_until;
+static void skip_cpu(bool boost){        /* the runtime's BOOST level is meant for short loads like this one */
+    if(set_performance&&session!=XR_NULL_HANDLE)XR(set_performance(session,XR_PERF_SETTINGS_DOMAIN_CPU_EXT,boost?XR_PERF_SETTINGS_LEVEL_BOOST_EXT:XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT));
+}
+static bool skip_update(void){            /* every host loop iteration: starts or ends the skip; true while it runs */
+    const int left=tc2_online_startup_left();
+    bool held=paused||!focused;
+#ifdef TCVR_PC
+    if(desktop)held=paused;               /* the desktop window runs on without focus */
+#endif
+    if(!skipping&&left>0&&!held&&(trigger>.55f||skip_test)){
+        skipping=true;skip_left=left;skip_started=SDL_GetPerformanceCounter();skip_until=0;apply_game_volume();tc2_online_startup_skipping();skip_cpu(true);
+        fprintf(stderr,"[BOOT] skipping the start-up: %d frames\n",left);
+    }
+    else if(skipping&&(left<=0||held)){
+        skipping=false;apply_game_volume();skip_cpu(false);
+        const double ms=(SDL_GetPerformanceCounter()-skip_started)*1000.0/SDL_GetPerformanceFrequency();
+        fprintf(stderr,"[BOOT] start-up %s: %d frames in %.0f ms (%.1fx)\n",left<=0?"skipped":"skip stopped",skip_left-(left>0?left:0),ms,
+                ms>0?(skip_left-(left>0?left:0))*1000.0/59.906/ms:0);
+    }
+    skip_test=false;
+    return skipping;
 }
 /* The game side opens or closes the ONLINE tab (tc2_online.c): a shot at the arcade's crossed-out SOLO/LINKED opens it, the
  * partner linking closes it again. */
@@ -272,6 +364,20 @@ static void set_cover_mode(bool physical){
     if(physical)cover_calibration_pending=true;
     fprintf(stderr,"[OPTIONS] cover %s; saved %d\n",physical?"PHYSICAL":"GRIP",options_saved);
 }
+static void set_game_volume(int value){
+    if(value<QOPTIONS_GAME_VOLUME_MIN)value=QOPTIONS_GAME_VOLUME_MIN;
+    if(value>QOPTIONS_GAME_VOLUME_MAX)value=QOPTIONS_GAME_VOLUME_MAX;
+    if(value==options.game_volume)return;
+    options.game_volume=value;apply_game_volume();
+    options_saved=qoptions_save(options_path,&options);
+    fprintf(stderr,"[OPTIONS] game volume %d%%; saved %d\n",value,options_saved);
+}
+static void set_skip_startup(bool on){
+    if(on==options.skip_startup)return;
+    options.skip_startup=on;tc2_online_set_startup_skip(on);
+    options_saved=qoptions_save(options_path,&options);
+    fprintf(stderr,"[OPTIONS] skip start-up %s; saved %d\n",on?"on":"off",options_saved);
+}
 static int menu_get(int o){
     switch(o){
     case QOPT_HAND:return options.left_handed?0:1;
@@ -285,6 +391,9 @@ static int menu_get(int o){
     case QOPT_DISTANCE:return options.view_distance;
     case QOPT_RESOLUTION:return options.resolution;
     case QOPT_FILTER:return options.texture_filtering?0:1;
+    case QOPT_GAME_VOLUME:return options.game_volume;
+    case QOPT_SKIP_STARTUP:return options.skip_startup;
+    case QOPT_VOICE_VOLUME:{tc2_online_view view;tc2_online_get_view(&view);return view.volume;}
     }
     return 0;
 }
@@ -301,6 +410,9 @@ static void menu_set(int o,int v){
     case QOPT_DISTANCE:set_view_distance(v);break;
     case QOPT_RESOLUTION:set_resolution(v);break;
     case QOPT_FILTER:if((v==0)!=options.texture_filtering)toggle_texture_filter();break;
+    case QOPT_GAME_VOLUME:set_game_volume(v);break;
+    case QOPT_SKIP_STARTUP:set_skip_startup(v!=0);break;
+    case QOPT_VOICE_VOLUME:tc2_online_set_volume(v);break;
     }
 }
 static void menu_action(int a){
@@ -320,10 +432,16 @@ void qhost_test(const char *action,const char *arg){
     else if(!strcmp(action,"resume"))menu_action(QACT_RESUME);
     else if(!strcmp(action,"restartgame"))menu_action(QACT_RESTART_GAME);
     else if(!strcmp(action,"restartapp"))menu_action(QACT_RESTART_APP);
+    else if(!strcmp(action,"skip"))skip_test=true;
     else fprintf(stderr,"[TEST] unknown action %s\n",action);
 }
 static void menu_host_refresh(void){
     menu_host.boot_player=boot_player_side-1;menu_host.boot_resolution=boot_resolution;menu_host.saved=options_saved;
+#ifdef TCVR_PC
+    menu_host.talk_key=desktop?"V":"STICK CLICK";
+#else
+    menu_host.talk_key="STICK CLICK";
+#endif
     menu_host.active_w=active_w;menu_host.active_h=active_h;
     menu_host.preset_unsupported=boot_resolution>0&&boot_resolution<QRESOLUTION_COUNT&&active_w&&
         (active_w!=qresolution_sizes[boot_resolution][0]||active_h!=qresolution_sizes[boot_resolution][1]);
@@ -445,7 +563,7 @@ static bool events(void){
                 if(k==SDLK_TAB)kb_tab+=(s.key.keysym.mod&KMOD_SHIFT)?-1:1;
             }else{
                 if(k==SDLK_c||k==SDLK_5)coin_frames=48;
-                if(k==SDLK_m&&tc2_online_session())tc2_online_toggle_mute();
+                if(k==SDLK_m&&tc2_online_session()&&!tc2_online_push_to_talk())tc2_online_toggle_mute();
                 if(k==SDLK_l)cycle_aim_guide();
                 if(k==SDLK_r)recenter_requested=true;
             }
@@ -464,7 +582,7 @@ static bool events(void){
             if(state==XR_SESSION_STATE_STOPPING){if(running)xrEndSession(session);running=false;game_deadline=0;}
             if(state==XR_SESSION_STATE_EXITING||state==XR_SESSION_STATE_LOSS_PENDING)quit=true;
             bool focus=state==XR_SESSION_STATE_FOCUSED;
-            if(focused!=focus){focused=focus;reset_input_edges();game_deadline=0;ss22_input_neutral();tc2_audio_volume(focus&&!paused?100:0);if(focus){rate_attempts=0;rate_check_time=0;}}
+            if(focused!=focus){focused=focus;reset_input_edges();game_deadline=0;ss22_input_neutral();apply_game_volume();if(focus){rate_attempts=0;rate_check_time=0;}}
         }else if(e.type==XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)quit=true;
         else if(e.type==XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING){recenter_requested=true;}
         else if(e.type==XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB){
@@ -481,12 +599,19 @@ static bool events(void){
 }
 static void sync_input(XrTime time,bool head_tracked,float head_y){
     trigger=pedal=0;aim_valid=gun_tracked=false;
-    if(!focused){reset_input_edges();return;}
+    if(!focused){reset_input_edges();tc2_online_talk_key(false);return;}
     XrActiveActionSet aset={action_set,XR_NULL_PATH};XrActionsSyncInfo sync={XR_TYPE_ACTIONS_SYNC_INFO};sync.countActiveActionSets=1;sync.activeActionSets=&aset;
     if(!XR(xrSyncActions(session,&sync))){reset_input_edges();return;}
     if(pressed(pause_action,XR_NULL_PATH,&pause_button))set_paused(!paused,-1);
-    if(pressed(pitch_reset_action,XR_NULL_PATH,&pitch_reset_button)&&!paused&&tc2_online_session())tc2_online_toggle_mute();   /* left stick click */
+    /* voice chat: the left stick click mutes an open mic; with push to talk, either stick click held talks (V too on a PC) */
+    const bool ptt=tc2_online_push_to_talk();
+    if(pressed(pitch_reset_action,XR_NULL_PATH,&pitch_reset_button)&&!paused&&!ptt&&tc2_online_session())tc2_online_toggle_mute();
     (void)pressed(hand_action,XR_NULL_PATH,&hand_button);
+    bool talk=(pitch_reset_button.synced&&pitch_reset_button.was)||(hand_button.synced&&hand_button.was);
+#ifdef TCVR_PC
+    talk=talk||SDL_GetKeyboardState(NULL)[SDL_SCANCODE_V];
+#endif
+    tc2_online_talk_key(ptt&&talk);
     /* Face-button roles follow the saved layout, even during trigger handoffs. In the menu: A / X select, B / Y go back. */
     int controls=options.left_handed?LEFT_HAND:RIGHT_HAND;XrPath weapon=hand_paths[controls],other=hand_paths[1-controls];
     const bool lower_w=pressed(lower_action,weapon,&coin_button),lower_o=pressed(lower_action,other,&recenter_button);
@@ -574,7 +699,7 @@ bool tc2_vr_open(void){
     qoptions_load(options_path,&options);tc2_gl_set_filter(options.texture_filtering);
     boot_player_side=options.player_side;boot_resolution=options.resolution;qvr_world_scale=options.world_scale/100.f;active_weapon_hand=options.left_handed?LEFT_HAND:RIGHT_HAND;
     qvr_view_distance=options.view_distance/100.f;
-    tc2_online_init();
+    tc2_online_init();tc2_online_set_startup_skip(options.skip_startup);
     fprintf(stderr,"[VR SCALE] %.6f reconstructed units/metre; world size %d%%; view distance %d cm\n",qvr_units_per_meter,options.world_scale,options.view_distance);
     fprintf(stderr,"[OPTIONS] laser %s; cover %s; default hand %s; trigger handoff enabled (left menu: options)\n",options.laser_enabled?"ON":"OFF",options.physical_crouch?"PHYSICAL":"GRIP",options.left_handed?"LEFT":"RIGHT");
     fprintf(stderr,"[OPTIONS] gun angle %+d deg\n",options.gun_pitch);
@@ -730,6 +855,7 @@ bool tc2_vr_open(void){
         for(uint32_t j=0;j<eye->n;j++){glBindFramebuffer(GL_FRAMEBUFFER,eye->fb[j]);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,eye->images[j].image,0);glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,eye->depth);if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)goto fail;}
         views[i]=(XrView){XR_TYPE_VIEW};
     }
+    menu_layer_open(color_format);
 graphics_ready:
     if(!qgl_init())goto fail;
 #ifndef TCVR_PC
@@ -741,7 +867,7 @@ graphics_ready:
     if(!qui_init())goto fail;
     active_w=eyes[0].w;active_h=eyes[0].h;
     if(!tc2_gl_init())goto fail;
-    void ss22_gl_set_gun_flash(int);ss22_gl_set_gun_flash(0);tc2_audio_open();
+    void ss22_gl_set_gun_flash(int);ss22_gl_set_gun_flash(0);tc2_audio_open();tc2_audio_volume(options.game_volume);
     active=true;fprintf(stderr,"[XR] Renderer initialized: %ux%u per eye; %s\n",eyes[0].w,eyes[0].h,glGetString(GL_RENDERER));return true;
 fail:
     fprintf(stderr,"[XR] initialization failed; SDL: %s\n",SDL_GetError());ss22_host_close();return false;
@@ -767,6 +893,7 @@ static bool desktop_frame(void){
         nx=fminf(1,fmaxf(0,(float)mx/lw));ny=fminf(1,fmaxf(0,(float)my/lh));
         aim_valid=true;gun_tracked=false;trigger=focused&&!paused&&(mouse&SDL_BUTTON_LMASK)?1:0;
         pedal=focused&&!paused&&((mouse&SDL_BUTTON_RMASK)||SDL_GetKeyboardState(NULL)[SDL_SCANCODE_SPACE])?1:0;
+        tc2_online_talk_key(focused&&SDL_GetKeyboardState(NULL)[SDL_SCANCODE_V]);   /* push to talk, held */
         /* Match the original 640x480 camera exactly for mouse aiming and tests. */
         int vw=w,vh=w*3/4;if(vh>h){vh=h;vw=h*4/3;}
         nx=((float)mx/lw*w-(w-vw)*.5f)/vw;ny=((float)my/lh*h-(h-vh)*.5f)/vh;
@@ -788,7 +915,7 @@ static bool desktop_frame(void){
         hud_camera();qgl_target(0,0);qgl_eye(v,p);qtc2_draw(v,p,w,h,0);qgl_flush();
         if(options.laser_enabled&&aim_valid&&!paused){qgl_pointer(v3(.24f,-.24f,-.45f),v3((nx-.5f)*3.2f,(.5f-ny)*2.4f,-2.5f));qgl_flush();}
         online_overlays(v,p,v3(0,0,0),(Q4){0,0,0,1});
-        if(paused){menu_host_refresh();qui_draw_menu(v,p,menu_center,menu_rotation,&menu_host,SDL_GetTicks64()/1000.0);}
+        if(paused){menu_host_refresh();qui_draw_menu(v,p,menu_center,menu_rotation,&menu_host,SDL_GetTicks64()/1000.0,false);}
         const char *capture_frame=getenv("TCVR_CAPTURE_FRAME");
         const char *capture_every=getenv("TCVR_CAPTURE_EVERY");++frame_number;
         {const char *menu=getenv("TCVR_TEST_MENU");const char *at=menu?strchr(menu,'@'):NULL;   /* "tab@frame": open the menu there */
@@ -798,7 +925,8 @@ static bool desktop_frame(void){
             if(capture_every){char name[32];snprintf(name,sizeof name,"cap-%06u.ppm",frame_number);remove(name);rename("eye-0.ppm",name);}}
         GLenum error=glGetError();if(error)fprintf(stderr,"[GL] desktop error 0x%x\n",error);
         SDL_GL_SwapWindow(window);
-        if(!fast){Uint64 now=SDL_GetPerformanceCounter(),freq=SDL_GetPerformanceFrequency();if(!deadline||now>deadline+freq/4)deadline=now;deadline+=freq*1000/59906;while((now=SDL_GetPerformanceCounter())<deadline)SDL_Delay(1);}
+        const bool skip=skip_update();   /* skipping the start-up: no pacing */
+        if(!fast&&!skip){Uint64 now=SDL_GetPerformanceCounter(),freq=SDL_GetPerformanceFrequency();if(!deadline||now>deadline+freq/4)deadline=now;deadline+=freq*1000/59906;while((now=SDL_GetPerformanceCounter())<deadline)SDL_Delay(1);}
         if((!paused||tc2_online_session())&&tc2_online_may_advance()){ss22_input_update();return true;}   /* stall-and-wait: render on, hold the arcade */
     }
 }
@@ -822,6 +950,8 @@ bool ss22_host_frame(void){
             }
             wall_deadline=0;SDL_Delay(10);continue;
         }
+        /* skipping the start-up: more arcade frames between headset frames, for most of a display period after each one */
+        if(skip_update()&&!sim_held(last_tracking)&&SDL_GetPerformanceCounter()<skip_until){ss22_input_update();return true;}
         if(game_deadline&&!sim_held(last_tracking)&&last_display_time>=game_deadline){
             if(tc2_online_may_advance()&&qclock_take(&game_deadline,last_display_time)){ss22_input_update();return true;}
         }
@@ -861,6 +991,7 @@ bool ss22_host_frame(void){
         }
         hud_camera();
         bool stereo_frame=false;
+        const bool menu_shown=draw_frame&&focused&&paused&&menu_placed,menu_under=menu_shown&&menu_layer.ok;
         for(int i=0;draw_frame&&i<2;i++){
             stage_start=wall_ms();
             struct Eye *eye=&eyes[i];uint32_t index;
@@ -882,7 +1013,7 @@ bool ss22_host_frame(void){
                 V3 head=mul(add(relative_position(views[0].pose.position),relative_position(views[1].pose.position)),.5f);
                 online_overlays(v[i],p[i],head,relative_rotation(views[0].pose.orientation));
                 if(paused&&menu_placed){
-                    menu_host_refresh();qui_draw_menu(v[i],p[i],menu_center,menu_rotation,&menu_host,SDL_GetTicks64()/1000.0);
+                    menu_host_refresh();qui_draw_menu(v[i],p[i],menu_center,menu_rotation,&menu_host,SDL_GetTicks64()/1000.0,menu_under);
                     if(menu_laser&&gun_tracked){qgl_eye(v[i],p[i]);qgl_pointer(gun_origin,menu_end);qgl_flush();}
                 }
             }
@@ -904,14 +1035,25 @@ bool ss22_host_frame(void){
             parts[4]+=wall_ms()-stage_start;
         }
         XrCompositionLayerProjection layer={XR_TYPE_COMPOSITION_LAYER_PROJECTION};layer.space=local_space;layer.viewCount=2;layer.views=pv;
-        const XrCompositionLayerBaseHeader *layers[]={(const XrCompositionLayerBaseHeader*)&layer};
-        XrFrameEndInfo end={XR_TYPE_FRAME_END_INFO};end.displayTime=frame.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;end.layerCount=draw_frame&&frame_ok?1:0;end.layers=layers;
+        XrCompositionLayerQuad menu_quad={XR_TYPE_COMPOSITION_LAYER_QUAD};
+        const XrCompositionLayerBaseHeader *layers[2]={(const XrCompositionLayerBaseHeader*)&layer};uint32_t layer_count=1;
+        if(menu_under&&frame_ok&&menu_layer_update()){   /* the menu first (under), the picture over it, blended by its alpha */
+            const V3 at=add(origin,rotate(origin_rotation,menu_center));const Q4 facing=product(origin_rotation,menu_rotation);
+            menu_quad.space=local_space;menu_quad.eyeVisibility=XR_EYE_VISIBILITY_BOTH;
+            menu_quad.subImage.swapchain=menu_layer.chain;menu_quad.subImage.imageRect.extent=(XrExtent2Di){QMENU_W,QMENU_H};
+            menu_quad.pose.position=(XrVector3f){at.x,at.y,at.z};menu_quad.pose.orientation=(XrQuaternionf){facing.x,facing.y,facing.z,facing.w};
+            menu_quad.size=(XrExtent2Df){QUI_PANEL_W,QUI_PANEL_H};
+            layer.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT|XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+            layers[0]=(const XrCompositionLayerBaseHeader*)&menu_quad;layers[1]=(const XrCompositionLayerBaseHeader*)&layer;layer_count=2;
+        }
+        XrFrameEndInfo end={XR_TYPE_FRAME_END_INFO};end.displayTime=frame.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;end.layerCount=draw_frame&&frame_ok?layer_count:0;end.layers=layers;
         stage_start=wall_ms();
         if(!XR(xrEndFrame(session,&end))||!frame_ok)return false;
         parts[5]+=wall_ms()-stage_start;
         if(draw_frame&&focused&&!paused){for(int j=0;j<6;j++)profile_parts[j]+=parts[j];profile_thread+=cpu_ms()-cpu_start;}
         else{memset(profile_parts,0,sizeof profile_parts);profile_thread=0;}
         frame_profile(render_start,frame.predictedDisplayPeriod,draw_frame&&focused&&!paused);
+        if(skipping)skip_until=SDL_GetPerformanceCounter()+(Uint64)(SDL_GetPerformanceFrequency()*(frame.predictedDisplayPeriod*.75e-9));
         if(sim_held(tracking)){ss22_input_neutral();game_deadline=0;continue;}
         if(tc2_online_may_advance()&&qclock_take(&game_deadline,frame.predictedDisplayTime)){ss22_input_update();return true;}
     }
@@ -977,6 +1119,7 @@ void ss22_host_shot(const char *p){(void)p;}
 void ss22_host_close(void){
     active=false;
     if(context&&gpu_ready){qui_shutdown();qgun_shutdown();qgl_shutdown();}
+    menu_layer_close();
     for(int i=0;i<2;i++){if(context&&gpu_ready&&eyes[i].fb)glDeleteFramebuffers(eyes[i].n,eyes[i].fb);if(context&&gpu_ready)glDeleteRenderbuffers(1,&eyes[i].depth);if(eyes[i].chain)xrDestroySwapchain(eyes[i].chain);free(eyes[i].images);free(eyes[i].fb);memset(&eyes[i],0,sizeof eyes[i]);}
     for(int i=0;i<HAND_COUNT;i++){if(aim_spaces[i])xrDestroySpace(aim_spaces[i]);aim_spaces[i]=0;}
     if(local_space)xrDestroySpace(local_space);

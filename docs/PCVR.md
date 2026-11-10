@@ -20,7 +20,7 @@ Extract the entire Windows ZIP to a writable folder. Keep `TimeCrisis2VR.exe`, t
 
 ## Controls
 
-After the arcade startup, press **A** for credits and either trigger to start. Either trigger selects that hand and shoots. Hold either grip to leave cover; release both to hide/reload. **B** cycles LASER / OFF / TRACER, **X** recenters, and the left menu button opens the menu: default hand, aim guide, physical ducking, gun angle, gun fit, player route, world size, view distance, graphics and online play, plus RESUME, RESTART GAME, RECENTER and RESTART APP. Point the gun and pull the trigger, or use either stick with A / B; the grips switch tabs. Saved left-hand mode swaps the face-button layout: X credits, Y aim mode, A recenter.
+After the arcade startup, press **A** for credits and either trigger to start. Either trigger selects that hand and shoots. Hold either grip to leave cover; release both to hide/reload. **B** cycles LASER / OFF / TRACER, **X** recenters, and the left menu button opens the menu: default hand, aim guide, physical ducking, gun angle, gun fit, player route, world size, view distance, graphics, game and voice volume, and online play, plus RESUME, RESTART GAME, RECENTER and RESTART APP. Point the gun and pull the trigger, or use either stick with A / B; the grips switch tabs. Saved left-hand mode swaps the face-button layout: X credits, Y aim mode, A recenter.
 
 The machine gun is equipped automatically in scripted sections. Hold the trigger outside cover for automatic fire. The tracked weapon changes model, and shots have recoil and muzzle flash; the Namco gun uses whole-model recoil. The older pistol remains a fallback.
 
@@ -30,7 +30,7 @@ The machine gun is equipped automatically in scripted sections. Hold the trigger
 
 L cycles the aim mode. Tracer Squeeze is a tracked-VR effect and flashes for 65 ms on accepted shots.
 
-**Play Desktop.cmd** runs without a headset. Mouse aims, left mouse shoots, right mouse or Space operates the pedal, **5** inserts credits and **Escape** opens the menu, where the mouse points and clicks.
+**Play Desktop.cmd** runs without a headset. Mouse aims, left mouse shoots, right mouse or Space operates the pedal, **5** inserts credits and **Escape** opens the menu, where the mouse points and clicks. Online, **M** mutes an open mic and holding **V** talks with push to talk (in VR too, beside the thumbstick clicks).
 
 ## Troubleshooting and diagnostics
 

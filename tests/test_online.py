@@ -4,15 +4,19 @@ Needs a Windows build (tools/build_pc.py). Each scenario starts cabinet A (hosts
 session's cabinet assignment is exercised, feeds both the same scripted coins / start / fire (an arcade input recording), and
 reads the game's own link state from the [ONLINE] status lines: the C422 driver's alive flag, its error counters and the lag.
 Room scenarios run upstream's current nmn-server (build/nmn-server-head, see docs/ONLINE.md) on 127.0.0.1 only. Microphones are replaced by
-WAV files (a tone for A, silence for B), so no real microphone is opened; what B plays back is recorded and analysed.
+WAV files (a synthetic voice for A, tests/speech.py; silence for B), so no real microphone is opened; what B plays back is recorded
+and compared with what A said. The microphone's echo cancellation and noise suppression run as in play.
 
     python -X utf8 tests/test_online.py                 # every scenario (20 scenarios + crossplay, ~40 minutes, real time)
     python -X utf8 tests/test_online.py basic room      # some
     python -X utf8 tests/test_online.py --keep          # keep screenshots: build/online-test/<scenario>/{A,B}/cap-*.ppm
 """
 from pathlib import Path
-import math, os, re, shutil, struct, subprocess, sys, threading, time, wave
+import math, os, re, shutil, subprocess, sys, threading, time, wave
 from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from speech import speech  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / 'artifacts/pc/TimeCrisis2VR-PC'
@@ -23,28 +27,32 @@ SERVER_EXE = BUILD / 'nmn-server-head/target/release/nmn-server.exe'   # upstrea
 SERVER_PORT = 27751
 STATUS = re.compile(r'\[ONLINE\] frame (\d+) side P(\d) link (on|off|stand-in) alive (\d) lag (\d+) state (\d+) tx (\d+) rx (\d+) '
                     r'drop (\d+) bad (\d+)/(\d+) game-errors (\d+) ping (-?\d+) \| voice (on|off) sent (\d+) received (\d+) lost (\d+)')
-TONE_HZ = 440
 
 
-def recording(path: Path, frames: int, aim_until: int = 0, coins_at: int = 1500, again_at: int = 0, idle: str = '', aim_again: str = ''):
+def recording(path: Path, frames: int, aim_until: int = 0, coins_at: int = 1500, again_at: int = 0, idle: str = '', aim_again: str = '',
+              coins: bool = True, exposed: int = 0, out_of: int = 34, n_coins: int = 8):
     """Coins and start at 1500 / 1700 (or coins_at / +200), then the pedal held and the trigger pulsed while the aim sweeps
     (held on the mode screen's top panel until aim_until); again_at: coins once more (a cabinet that restarted); idle 'a-b': no
-    trigger, pedal or aim from frame a to b (a player who lets SELECT GAME MODE run out); aim_again 'a-b': the aim held on the
-    mode screen's top panel again from a to b (a cabinet that restarted and comes back to SOLO/LINKED)."""
+    trigger, pedal or aim from frame a to b (a player who lets SELECT GAME MODE run out); exposed: from that frame on, out of cover
+    and never firing, so the player loses every life and lets the continue run out; out_of: frames-in-40 out of cover (fewer: a
+    careful player who outlives the other); aim_again 'a-b': the aim held on the
+    mode screen's top panel again from a to b (a cabinet that restarted and comes back to SOLO/LINKED); coins False: the start,
+    trigger and aim at the same times, but no coins (a player who leaves it to "Join with a credit")."""
     events = [(0, '0000', 457, 161)]
     for at in (coins_at, again_at):
-        if not at:
+        if not at or not coins:
             continue
-        for i in range(8):
+        for i in range(n_coins):
             events += [(at + 12 * i, '0001', 457, 161), (at + 12 * i + 6, '0000', 457, 161)]
-    events += [(coins_at + 200, '0010', 457, 161), (coins_at + 206, '0000', 457, 161)]
-    f, k = coins_at + 400, 0
+    start = coins_at + max(200, 12 * n_coins + 20)
+    events += [(start, '0010', 457, 161), (start + 6, '0000', 457, 161)]
+    f, k = start + 200, 0
     again = tuple(int(v) for v in aim_again.split('-')) if aim_again else (0, 0)
     while f < frames:
         held = f < aim_until or again[0] <= f < again[1]
         x, y = (457, 161) if held else (int(457 + 250 * math.sin(k * .37)), int(161 + 80 * math.sin(k * .23)))
         # release the pedal now and then to reload
-        pedal = '0020' if (k % 40) < 34 else '0000'
+        pedal = '0020' if (k % 40) < out_of else '0000'
         fire = '0030' if pedal == '0020' else '0000'
         events += [(f, fire, x, y), (f + 4, pedal, x, y)]
         f += 8
@@ -55,39 +63,59 @@ def recording(path: Path, frames: int, aim_until: int = 0, coins_at: int = 1500,
         events = [e for e in events if not (a <= e[0] < b + 300 and e[1] not in ('0001', '0000'))]
         # then the trigger alone: one pull to come back, one to choose (a pedal held as the game starts opens GUN INITIALIZATION)
         events += [(b, '0010', 457, 161), (b + 6, '0000', 457, 161), (b + 150, '0010', 457, 161), (b + 156, '0000', 457, 161)]
+    if exposed:
+        events = [e for e in events if e[0] < exposed] + [(exposed, '0020', 457, 161)]
     events.sort(key=lambda e: e[0])                       # the replay reads in order
     lines = ['# TC2 session: F frame inputs gunx guny off'] + [f'F {f} {i} {x} {y} 0' for f, i, x, y in events]
     path.write_text('\n'.join(lines) + '\n')
 
 
-def microphone(path: Path, seconds: int, tone: bool):
-    """48 kHz mono: a 440 Hz 'voice' one second on, one second off (or silence)."""
+def microphone(path: Path, seconds: int, voice: str = ''):
+    """48 kHz mono: a synthetic voice ('near' or 'far', tests/speech.py) saying its lines over and over, a second's pause between
+    (or silence). Tones would not do: noise suppression takes them out, as it should."""
     rate = 48000
+    clip = b''
+    if voice:
+        with wave.open(str(speech(voice))) as w:
+            clip = w.readframes(w.getnframes()) + bytes(2 * rate)
     with wave.open(str(path), 'wb') as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
-        frames = bytearray()
-        for n in range(seconds * rate):
-            on = tone and (n // rate) % 2 == 0
-            frames += struct.pack('<h', int(9000 * math.sin(2 * math.pi * TONE_HZ * n / rate)) if on else 0)
-        w.writeframes(bytes(frames))
+        want = seconds * rate * 2
+        w.writeframes((clip * (want // len(clip) + 1))[:want] if clip else bytes(want))
 
 
-def voice_check(path: Path):
-    """What B played back: enough sound, and 440 Hz the strongest tone in it."""
+def _bands(pcm):
+    """The long-term spectrum of the voiced 40 ms frames, in 16 bands from 200 Hz to 7 kHz (log power); None: too little voice."""
+    import numpy
+    f = 1920
+    x = pcm[:len(pcm) // f * f].reshape(-1, f)
+    x = x[numpy.sqrt((x ** 2).mean(axis=1)) > 300]
+    if len(x) < 12:
+        return None
+    power = numpy.abs(numpy.fft.rfft(x * numpy.hanning(f), axis=1)) ** 2
+    freqs = numpy.fft.rfftfreq(f, 1 / 48000)
+    edges = numpy.geomspace(200, 7000, 17)
+    return numpy.log10(numpy.array([power[:, (freqs >= a) & (freqs < b)].mean() for a, b in zip(edges[:-1], edges[1:])]) + 1e-9)
+
+
+def voice_check(path: Path, voice: str = 'near'):
+    """What a cabinet played back: over a second of voice, loud enough, and with the spectrum of what the partner said."""
     import numpy
     if not path.exists() or path.stat().st_size <= 44:
         return 'no voice was played back'
     with wave.open(str(path)) as w:
         pcm = numpy.frombuffer(w.readframes(w.getnframes()), dtype='<i2').astype(numpy.float64)
-    if len(pcm) < 48000:
-        return f'only {len(pcm) / 48000:.2f} s of voice was played back'
-    loud = numpy.sqrt(numpy.mean(pcm ** 2))
-    spectrum = numpy.abs(numpy.fft.rfft(pcm[:48000 * (len(pcm) // 48000)]))
-    peak = numpy.fft.rfftfreq(48000 * (len(pcm) // 48000), 1 / 48000)[spectrum.argmax()]
+    heard = _bands(pcm)
+    if heard is None:
+        return f'only {len(pcm) / 48000:.2f} s played back, too little of it voice'
+    loud = numpy.sqrt(numpy.mean(pcm[numpy.abs(pcm) > 0] ** 2)) if numpy.any(pcm) else 0
     if loud < 500:
         return f'played back too quietly (RMS {loud:.0f})'
-    if abs(peak - TONE_HZ) > 5:
-        return f'played back {peak:.1f} Hz, sent {TONE_HZ} Hz'
+    with wave.open(str(speech(voice))) as w:
+        said = _bands(numpy.frombuffer(w.readframes(w.getnframes()), dtype='<i2').astype(numpy.float64))
+    alike = float(numpy.corrcoef(heard, said)[0, 1])
+    if alike < 0.9:
+        return f'what was played back does not sound like what was said (spectra {alike:.2f} alike)'
     return None
 
 
@@ -109,6 +137,12 @@ SCENARIOS = {
     'voicenet': (3600, '600:hostroom', '700:joincode=KXQ7', {'TC2_NET_ROOM_CODE': 'KXQ7', 'TC2_NET_SIM': '5,150'}, 'voice'),
     'duplex': (3600, '600:hostroom', '700:joincode=KXQ7', {'TC2_NET_ROOM_CODE': 'KXQ7'}, 'duplex'),
     'roomleave': (4800, '600:hostroom', '700:joincode=KXQ7;2700:leave;3000:joincode=KXQ7', {'TC2_NET_ROOM_CODE': 'KXQ7'}, 'rejoin'),
+    # push to talk: A talks all along but holds the key only from 1500 to 2400; B hears it then and only then
+    'ptt':    (3600, '600:hostroom;1500:talk=1;2400:talk=0', '700:joincode=KXQ7', {'TC2_NET_ROOM_CODE': 'KXQ7', 'A_CFG': 'push_to_talk=1'}, 'ptt'),
+    # echo: B's microphone hears B's own speaker (the game, and A's voice) 60 ms late at 0.8; B says nothing. The echo canceller
+    # takes the speaker out once it has learned the room: measured, 85 frames of A's voice went back to A in the first 3 s of the
+    # session and none after; without the canceller (TC2_VOICE_DSP=2 on B) 1514, all along
+    'echo':   (3600, '600:hostroom', '700:joincode=KXQ7', {'TC2_NET_ROOM_CODE': 'KXQ7', 'B_ENV': 'TC2_VOICE_ECHO=0.8,60'}, 'echo'),
     # P2 the arcade's way: linked first, A starts LINK PLAY, B puts coins in once A's game is under way and takes the top panel
     'p2join': (6000, '600:hostroom', '700:joincode=KXQ7', {'TC2_NET_ROOM_CODE': 'KXQ7', 'TCVR_RAMWATCH': '2CE92B,2F3930,2F3502',
                'AIM_UNTIL': 2600, 'B_COINS_AT': 3000, 'B_AIM_UNTIL': 5000}, 'p2join'),
@@ -148,9 +182,27 @@ SCENARIOS = {
     'persist': (4200, '900:rejoin', '600:hostroom', {'TC2_NET_ROOM_CODE': 'KXQ7', 'A_REJOIN': 'rejoin=1 KXQ7 1 {now} CABB'}, 'persist'),
     'dropin': (8400, '600:hostroom', '3600:joincode=KXQ7', {'TC2_NET_ROOM_CODE': 'KXQ7', 'TCVR_RAMWATCH': '2CE92B,2F3930,2F3502',
                'B_COINS_AT': 4800, 'B_AIM_UNTIL': 7400}, 'dropin'),
+    # "Join with a credit": the drop-in, but B never puts a coin in. Once its handshake restart is done and A's game runs, one
+    # credit goes in for B, and B takes LINK PLAY with it
+    'credit': (8400, '600:hostroom', '3600:joincode=KXQ7', {'TC2_NET_ROOM_CODE': 'KXQ7', 'TCVR_RAMWATCH': '2CE92B,2F3930,2F3502,2CE7B7',
+               'B_COINS_AT': 4800, 'B_AIM_UNTIL': 7400, 'B_NO_COINS': '1', 'B_CFG': 'join_credit=1'}, 'dropin'),
+    # P1's game ends (A loses every life and lets the continue run out) while P2's goes on, and the lobby server's session limit
+    # (1 minute here) comes round meanwhile: as in the arcade, P2 plays on
+    'p1over': (22200, '600:hostroom', '700:joincode=KXQ7', {'TC2_NET_ROOM_CODE': 'KXQ7', 'TCVR_RAMWATCH': '2CE92B,2F3930,2F3502,2F3FD3',
+               'AIM_UNTIL': 2600, 'B_COINS_AT': 3000, 'B_AIM_UNTIL': 5000, 'B_IDLE': '3700-30000', 'A_COINS_N': 4,
+               'SERVER_ARGS': '--max-session-min 1'}, 'p1over'),
+    # P1 stops (one credit, its game over) and P2 plays on: P2 hides until 14000, then fights, dies and continues with its own
+    # coins, as at the arcade (before, P2's trigger and coins were held while P1 was not in a game, so P2 could not continue)
+    'p2continue': (26400, '600:hostroom', '700:joincode=KXQ7', {'TC2_NET_ROOM_CODE': 'KXQ7', 'TCVR_RAMWATCH': '2CE92B,2F3930,2F3502,2F3FD3,2CE7B7',
+                   'AIM_UNTIL': 2600, 'B_COINS_AT': 3000, 'B_AIM_UNTIL': 5000, 'B_IDLE': '3900-14000', 'A_COINS_N': 4, 'B_COINS_N': 24},
+                   'p2continue'),
+    # the lobby server's session limit (15 minutes on the public server) ends the session under a linked game: here 1 minute, with
+    # both cabinets in LINK PLAY (the p2join game). The game must go on for both, as if nothing happened
+    'sessionlimit': (7800, '600:hostroom', '700:joincode=KXQ7', {'TC2_NET_ROOM_CODE': 'KXQ7', 'TCVR_RAMWATCH': '2CE92B,2F3930,2F3502,2F3FD3',
+                     'AIM_UNTIL': 2600, 'B_COINS_AT': 3000, 'B_AIM_UNTIL': 5000, 'SERVER_ARGS': '--max-session-min 1'}, 'sessionlimit'),
 }
 ROOM_SCENARIOS = {'room', 'browse', 'mute', 'voicenet', 'duplex', 'roomleave', 'modescreen', 'p2join', 'dropin', 'menutimeout', 'menulinked',
-                  'p1return', 'p2return', 'newcomer', 'persist'}
+                  'p1return', 'p2return', 'newcomer', 'persist', 'ptt', 'echo', 'credit', 'sessionlimit', 'p1over', 'p2continue'}
 
 
 # Lanes, so the scenarios run side by side: lane 0 is the cabinet folders A / B and lobby port 27751 (the LAN scenarios all run
@@ -192,7 +244,8 @@ def cabinet(directory: Path, server: str):
     for stale in [*directory.glob('cap-*.ppm'), *directory.glob('*.log'), *directory.glob('*.rec'), *directory.glob('*.nv'), *directory.glob('*.wav')]:
         stale.unlink()
     (directory / 'quest-options.cfg').write_text('player_side=1\n')
-    (directory / 'online.cfg').write_text(f'name=CAB{directory.name}\nserver={server}\n')
+    # "Join with a credit" off: the scenarios put their coins in themselves (the credit scenario turns it on for B)
+    (directory / 'online.cfg').write_text(f'name=CAB{directory.name}\nserver={server}\njoin_credit=0\n')
 
 
 def run(name: str, keep: bool, lane: int = 0):
@@ -207,29 +260,37 @@ def run(name: str, keep: bool, lane: int = 0):
     for side in 'AB':
         cabinet(cab[side], server)
     recording(rec, frames, int(extra.pop('AIM_UNTIL', 0)), again_at=int(extra.pop('A_COINS_AGAIN', 0)), idle=extra.pop('A_IDLE', ''),
-              aim_again=extra.pop('A_AIM_AGAIN', ''))
+              aim_again=extra.pop('A_AIM_AGAIN', ''), exposed=int(extra.pop('A_EXPOSED', 0)), coins=not extra.pop('A_NO_COINS', ''),
+              n_coins=int(extra.pop('A_COINS_N', 8)))
     recs = {'A': rec, 'B': rec}
     if 'B_COINS_AT' in extra:                                # B's own inputs: it puts coins in later
         recs['B'] = base / 'inputs_b.rec'
         recording(recs['B'], frames, int(extra.pop('B_AIM_UNTIL', 0)), int(extra.pop('B_COINS_AT')),
-                  again_at=int(extra.pop('B_COINS_AGAIN', 0)), aim_again=extra.pop('B_AIM_AGAIN', ''))
+                  again_at=int(extra.pop('B_COINS_AGAIN', 0)), aim_again=extra.pop('B_AIM_AGAIN', ''), coins=not extra.pop('B_NO_COINS', ''),
+                  out_of=int(extra.pop('B_OUT_OF', 34)), n_coins=int(extra.pop('B_COINS_N', 8)), idle=extra.pop('B_IDLE', ''))
     if 'A_REJOIN' in extra:                                  # A remembers a room in online.cfg, as after an app restart
         with open(cab['A'] / 'online.cfg', 'a') as f:
             f.write(extra.pop('A_REJOIN').replace('{now}', str(int(time.time()))) + '\n')
+    for side in 'AB':                                        # more online.cfg lines (push to talk, a credit to join with)
+        if f'{side}_CFG' in extra:
+            with open(cab[side] / 'online.cfg', 'a') as f:
+                f.write(extra.pop(f'{side}_CFG') + '\n')
+    server_args = extra.pop('SERVER_ARGS', '').split()
+    side_env = {side: dict(kv.split('=', 1) for kv in extra.pop(f'{side}_ENV').split(';')) if f'{side}_ENV' in extra else {} for side in 'AB'}
     seconds = frames // 60 + 30
-    microphone(cab['A'] / 'mic.wav', seconds, tone=True)
-    microphone(cab['B'] / 'mic.wav', seconds, tone=check == 'duplex')   # both talking at once: the echo safeguard must not mute either
+    microphone(cab['A'] / 'mic.wav', seconds, 'near')
+    microphone(cab['B'] / 'mic.wav', seconds, 'far' if check == 'duplex' else '')   # both talking at once: the echo safeguard must not mute either
     lobby = None
     if name in ROOM_SCENARIOS:
         if not SERVER_EXE.exists():
             sys.exit("Build upstream's current lobby server first (see docs/ONLINE.md, Testing)")
-        lobby = subprocess.Popen([str(SERVER_EXE), '--port', str(port), '--bind', '127.0.0.1', '--max-per-ip', '16', '--quiet'],
+        lobby = subprocess.Popen([str(SERVER_EXE), '--port', str(port), '--bind', '127.0.0.1', '--max-per-ip', '16', '--quiet', *server_args],
                                  stdout=open(base / 'server.log', 'w'), stderr=subprocess.STDOUT)
         time.sleep(0.5)
     procs = []
     for side, script in (('A', script_a), ('B', script_b)):
         env = dict(os.environ, SDL_AUDIODRIVER='dummy', TCVR_TEST_HIDDEN='1', TC2_REPLAY=str(recs[side]), TC2_NET_STATUS='1', TC2_NET_SCRIPT=script,
-                   TC2_VOICE_IN=str(cab[side] / 'mic.wav'), TC2_VOICE_OUT=str(cab[side] / 'voice_out.wav'), **extra)
+                   TC2_VOICE_IN=str(cab[side] / 'mic.wav'), TC2_VOICE_OUT=str(cab[side] / 'voice_out.wav'), **extra, **side_env[side])
         if keep:
             env.setdefault('TCVR_CAPTURE_EVERY', '600')
         procs.append(subprocess.Popen([str(cab[side] / 'TimeCrisis2VR.exe'), '--desktop', '--no-dialog', '--frames', str(frames)],
@@ -270,9 +331,9 @@ def run(name: str, keep: bool, lane: int = 0):
         # a frozen cabinet falls behind real time; its partner reaches the frame limit and quits first, so look before that
         lost = max([int(m) for m in re.findall(r'freeze=(\d+)', script_a + script_b)] or [0]) * 60 // 1000
         tail = [r for r in linked if frames - 900 - lost <= r[0] < frames - lost - 60]
-        if check in ('steady', 'rejoin', 'recover', 'late', 'voice', 'mute', 'modescreen', 'menutimeout') and tail and not all(r[3] for r in tail):
+        if check in ('steady', 'rejoin', 'recover', 'late', 'voice', 'echo', 'mute', 'modescreen', 'menutimeout') and tail and not all(r[3] for r in tail):
             failures.append(f'{side}: partner not alive near the end')
-        if check in ('steady', 'voice'):
+        if check in ('steady', 'voice', 'echo'):
             dead = [r[0] for r in linked if r[0] >= 1200 and not r[3]]
             if dead:
                 failures.append(f'{side}: link down at frames {dead}')
@@ -347,11 +408,64 @@ def run(name: str, keep: bool, lane: int = 0):
         b_sent = [r[14] for r in rows['B'] if r[13] == 'on']
         if b_sent and b_sent[-1] > 10:
             failures.append(f'B sent {b_sent[-1]} voice frames from a silent microphone (the voice gate should stay shut)')
+    if check == 'echo':
+        problem = voice_check(base / 'B' / 'voice_out.wav')
+        if problem:
+            failures.append('voice A->B: ' + problem)
+        sent = [(r[0], r[14]) for r in rows['B'] if r[13] == 'on']
+        settled = [c for f, c in sent if sent and f >= sent[0][0] + 600]
+        if settled and settled[-1] > settled[0]:
+            failures.append(f'B sent {settled[-1] - settled[0]} frames of its own speaker echo after the canceller had 10 s to learn the room')
+        if sent and sent[-1][1] > 150:
+            failures.append(f'B sent {sent[-1][1]} frames of its own speaker echo in all (want under 150; ~1500 without the canceller)')
     if check == 'duplex':
         for side in 'AB':
-            problem = voice_check(base / side / 'voice_out.wav')
+            problem = voice_check(base / side / 'voice_out.wav', 'far' if side == 'A' else 'near')
             if problem:
                 failures.append(f'voice to {side}: ' + problem)
+    if check == 'ptt':
+        # B's status every 300 frames: nothing well before A holds the key at 1500 (B's frame 1200: A may run up to the link's lead
+        # ahead, more under load), voice while it is held, nothing new after 2400 (but the 200 ms after it is let go, and what was
+        # on the way)
+        received = [(r[0], r[15]) for r in rows['B'] if r[13] == 'on']
+        before = [c for f, c in received if f <= 1200]
+        held = [c for f, c in received if f <= 2400]
+        after = [c for f, c in received if f >= 2700]
+        if before and before[-1] > 2:
+            failures.append(f'{before[-1]} voice frames arrived before A held the talk key')
+        if not held or held[-1] - (before[-1] if before else 0) < 25:
+            failures.append('too little voice arrived while A held the talk key')
+        if after and after[-1] - after[0] > 0:
+            failures.append(f'{after[-1] - after[0]} voice frames arrived after A let go of the talk key')
+        if 'credit to join with' in logs['B']:
+            failures.append('B got a credit with "Join with a credit" off')
+    if check == 'p1over':
+        # A's game over (0x2F3FD3 1 -> 0) while B's runs, then a session end: the stand-in stays out and B plays on
+        over = {side: [int(f) for f in re.findall(r'\[RAM\] frame (\d+) 2F3FD3: 1 -> 0', logs[side])] for side in 'AB'}
+        ends = [int(f) for f in re.findall(r'frame (\d+): session in slot \d: keeping', logs['A'])]
+        a_over, b_over = (over['A'] or [None])[0], (over['B'] or [frames])[0]
+        if a_over is None or not any(a_over < e < b_over for e in ends):
+            failures.append(f'the case did not come up: A over at {a_over}, B over at {b_over}, sessions ended at {ends}')
+        if logs['A'].count('drop-in open') > 1:
+            failures.append('A: the stand-in took the place of a partner still in the room')
+        if 'restarts' in logs['B'] or len(re.findall(r'2F3FD3: \d+ -> 2', logs['B'])) != 1:
+            failures.append('B: its game did not run on to its own end')
+    if check == 'p2continue':
+        # A's game over, then B's credits going down (a continue: 0x2CE7B7, coins held) while its game runs on
+        a_over = [int(f) for f in re.findall(r'\[RAM\] frame (\d+) 2F3FD3: 1 -> 0', logs['A'])]
+        b_over = [int(f) for f in re.findall(r'\[RAM\] frame (\d+) 2F3FD3: 1 -> 0', logs['B'])]
+        spent = [(int(f), int(a), int(b)) for f, a, b in re.findall(r'\[RAM\] frame (\d+) 2CE7B7: (\d+) -> (\d+)', logs['B'])]
+        cont = [f for f, a, b in spent if b < a and a_over and f > a_over[0] and (not b_over or f < b_over[0])]
+        if not a_over:
+            failures.append('the case did not come up: A never finished its game')
+        elif not cont:
+            failures.append(f'B did not continue after A stopped (A over at {a_over[0]}, B over at {b_over[:1]}, B credits {spent[-6:]})')
+    if name == 'credit':
+        got = re.search(r'frame (\d+): a credit to join with: (\d+) coins in', logs['B'])
+        if not got:
+            failures.append('B was not given a credit to join with')
+        if logs['B'].count('a credit to join with') > 1:
+            failures.append('B was given more than one credit')
     if check == 'mute':
         received = [(r[0], r[15]) for r in rows['B'] if r[13] == 'on']
         before = [c for f, c in received if f <= 2400]
@@ -394,7 +508,7 @@ def crossplay(keep: bool, lane: int = 0):
     cabinet(cab['A'], f'127.0.0.1:{port}')
     rec = base / 'inputs.rec'
     recording(rec, frames)
-    microphone(cab['A'] / 'mic.wav', frames // 60 + 30, tone=True)
+    microphone(cab['A'] / 'mic.wav', frames // 60 + 30, 'near')
     lobby = subprocess.Popen([str(SERVER_EXE), '--port', str(port), '--bind', '127.0.0.1', '--quiet'], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     time.sleep(0.5)
     env = dict(os.environ, SDL_AUDIODRIVER='dummy', TCVR_TEST_HIDDEN='1', TC2_REPLAY=str(rec), TC2_NET_STATUS='1', TC2_NET_SCRIPT='600:hostroom', TC2_NET_ROOM_CODE='KXQ7',
@@ -438,8 +552,9 @@ def crossplay(keep: bool, lane: int = 0):
     return not failures
 
 
-# --quick: one of each kind (a LAN link, a room with voice, the drop-in, coming back, a newcomer, upstream's desktop game)
-QUICK = ['basic', 'room', 'dropin', 'p1return', 'newcomer', 'crossplay']
+# --quick: one of each kind (a LAN link, a room with voice, the drop-in, coming back, a newcomer, a credit to join with,
+# upstream's desktop game)
+QUICK = ['basic', 'room', 'dropin', 'p1return', 'newcomer', 'credit', 'crossplay']
 
 
 def main():

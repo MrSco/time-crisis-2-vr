@@ -26,7 +26,7 @@ static const QColor PANEL={12,19,29,245},EDGE={54,183,207,255},LINE={31,51,71,25
 enum { BODY_Y=135,BODY_H=428,CX0=29,CX1=1091,CW=CX1-CX0,CY0=BODY_Y+16,FOOT_Y=BODY_Y+BODY_H,COLW=520,COL2=CX0+COLW+22 };
 
 /* ---- ids: kind << 8 | argument ---- */
-enum { K_TAB=1,K_FOOT,K_ROW,K_SEG,K_STEP,K_TRACK,K_RESET,K_RES,K_ON,K_GAME,K_KEY,K_MBTN,K_VOICE,K_VOL,K_VOLROW,K_TABS };
+enum { K_TAB=1,K_FOOT,K_ROW,K_SEG,K_STEP,K_TRACK,K_RESET,K_RES,K_ON,K_GAME,K_KEY,K_MBTN,K_VOICE,K_VOL,K_VOLROW,K_TABS,K_CREDIT };
 #define ID(k,a) ((k)<<8|(a))
 #define KIND(id) ((id)>>8)
 #define ARG(id) ((id)&255)
@@ -51,15 +51,21 @@ static const RowDef PLAYER_ROWS[]={
     {QOPT_COVER,"Take cover","","GRIP: hold either grip to leave cover. DUCK: crouch for real to hide; RECENTER standing up to calibrate.",T_SEG,{"GRIP","DUCK"},2,0,1,1,0,"",false},
     {QOPT_WORLD,"World size","100% is life size","How big the arcade world feels around you.",T_SLIDER,{0},0,QOPTIONS_WORLD_SCALE_MIN,QOPTIONS_WORLD_SCALE_MAX,QOPTIONS_WORLD_SCALE_STEP,QOPTIONS_WORLD_SCALE_DEFAULT,"%",false},
     {QOPT_DISTANCE,"View distance","Pushes the view further away","Start at 0 cm and add distance if things feel too close.",T_SLIDER,{0},0,QOPTIONS_VIEW_DISTANCE_MIN,QOPTIONS_VIEW_DISTANCE_MAX,QOPTIONS_VIEW_DISTANCE_STEP,QOPTIONS_VIEW_DISTANCE_DEFAULT," cm",false},
+    {QOPT_SKIP_STARTUP,"Skip start-up","Shoot through the memory test and logos","ON: a shot during the arcade's start-up (memory test, countdown, logos) runs through it, silent. Not while linked online.",T_SEG,{"OFF","ON"},2,0,1,1,0,"",false},
 };
 static const RowDef GRAPHICS_ROWS[]={
     {QOPT_RESOLUTION,"Resolution","","Pixels per eye. Higher costs more GPU time. Default follows the headset. Applies after RESTART APP.",T_RES,{0},0,0,QRESOLUTION_COUNT-1,1,0,"",false},
     {QOPT_FILTER,"Texture filtering","Smooths world textures; text stays sharp","Applies immediately.",T_SEG,{"ON","OFF"},2,0,1,1,0,"",false},
 };
+static const RowDef AUDIO_ROWS[]={
+    {QOPT_GAME_VOLUME,"Game volume","The arcade's sound","The game's music, guns and voices. Voice chat is not affected.",T_SLIDER,{0},0,QOPTIONS_GAME_VOLUME_MIN,QOPTIONS_GAME_VOLUME_MAX,QOPTIONS_GAME_VOLUME_STEP,QOPTIONS_GAME_VOLUME_DEFAULT,"%",false},
+    {QOPT_VOICE_VOLUME,"Voice chat volume","Your partner online; also on the ONLINE tab","How loud your partner is. Over 100% boosts a quiet microphone.",T_SLIDER,{0},0,0,200,10,100,"%",false},
+};
 static const RowDef *row_def(int opt){
     for(size_t i=0;i<sizeof GUN_ROWS/sizeof *GUN_ROWS;i++)if(GUN_ROWS[i].opt==opt)return &GUN_ROWS[i];
     for(size_t i=0;i<sizeof PLAYER_ROWS/sizeof *PLAYER_ROWS;i++)if(PLAYER_ROWS[i].opt==opt)return &PLAYER_ROWS[i];
     for(size_t i=0;i<sizeof GRAPHICS_ROWS/sizeof *GRAPHICS_ROWS;i++)if(GRAPHICS_ROWS[i].opt==opt)return &GRAPHICS_ROWS[i];
+    for(size_t i=0;i<sizeof AUDIO_ROWS/sizeof *AUDIO_ROWS;i++)if(AUDIO_ROWS[i].opt==opt)return &AUDIO_ROWS[i];
     return NULL;
 }
 
@@ -249,7 +255,7 @@ static void header(void){
     }
 }
 static void tabs(void){
-    static const char *const names[QMENU_TAB_COUNT]={"GUN","PLAYER","GRAPHICS","ONLINE"};
+    static const char *const names[QMENU_TAB_COUNT]={"GUN","PLAYER","GRAPHICS","AUDIO","ONLINE"};
     rrect(3,BODY_Y-2,QMENU_W-6,2,0,LINE);
     if(drawing())qc_clip(&cv,0,0,QMENU_W,BODY_Y);
     float x=27;
@@ -420,39 +426,61 @@ static void on_item(int act,float x,float *y,int ic,const char *title,const char
     }
     next_row();*y+=76;
 }
+/* a row inside a box: its label, then a choice of n at the right; returns the option picked this frame, or -1 */
+static int box_choice(int kind,float x,float cy,const char *label,const char *const *opts,int n,int sel,const char *tip){
+    text(UI_M20,x+20,mid(UI_M20,cy,38),label,MUTED);
+    const int row=ID(kind,9);hit(row,(int)x,(int)cy,(int)COLW,38);focusable(row,F_SEG,(int)(x+COLW/2));say_help(row,tip);
+    float w[4],total=6;for(int i=0;i<n;i++){w[i]=width(UI_B16,opts[i])+28;if(w[i]<72)w[i]=72;total+=w[i];}
+    const float sx=x+COLW-20-total;rrect(sx,cy+3,total,32,10,WELL);rline(sx,cy+3,total,32,10,2,LINE);
+    int picked=-1;float ox=sx+3;
+    for(int i=0;i<n;i++){
+        const int id=ID(kind,i);hit(id,(int)ox,(int)cy+6,(int)w[i],26);
+        if(i==sel)rrect(ox,cy+6,w[i],26,8,ACCENT);else if(is_hover(id))rrect(ox,cy+6,w[i],26,8,HOVER);
+        text_fit(UI_B16,ox,mid(UI_B16,cy+6,26),w[i],opts[i],i==sel?INK:TEXT,1);
+        if(clicked(id))picked=i;
+        ox+=w[i];
+    }
+    if(is_focus(row))rline(x+8,cy,COLW-16,38,10,2,ACCENT);
+    if(pass==PASS_ACT&&ev_adjust==row)picked=(sel+ev_adjust_dir+n)%n;
+    if(pass==PASS_ACT&&stick_mode&&ev_click==row)picked=(sel+1)%n;
+    next_row();
+    return picked;
+}
 static float voice_box(float x,float y,const char *title){
-    const bool on=V.voice;
-    const int rows=on?4:1,notes=(on&&V.mic_denied)?1:(!on?1:0);
+    const bool on=V.voice,partner=V.state==TC2V_LINKED||V.state==TC2V_RECONNECTING;
+    const int rows=on?(partner?4:3):1,notes=(on&&V.mic_denied)?1:(!on?1:0);
     const float h=52+rows*38+notes*23;
     float cy=box(x,y,COLW,h,title,MUTED,LINE);
-    /* voice on / off */
-    text(UI_M20,x+20,mid(UI_M20,cy,38),"Voice chat",MUTED);
-    {const int row=ID(K_VOICE,9);hit(row,(int)x,(int)cy,(int)COLW,38);focusable(row,F_SEG,(int)(x+COLW/2));say_help(row,"Voice chat with your partner, while you are linked.");
-     float sx=x+COLW-20-152;rrect(sx,cy+3,152,32,10,WELL);rline(sx,cy+3,152,32,10,2,LINE);
-     for(int i=0;i<2;i++){const int id=ID(K_VOICE,i);const bool sel=(i==0)==on,h2=is_hover(id);hit(id,(int)sx+3+i*74,(int)cy+6,72,26);
-        if(sel)rrect(sx+3+i*74,cy+6,72,26,8,ACCENT);else if(h2)rrect(sx+3+i*74,cy+6,72,26,8,HOVER);
-        text_fit(UI_B16,sx+3+i*74,mid(UI_B16,cy+6,26),72,i?"OFF":"ON",sel?INK:TEXT,1);
-        if(clicked(id))tc2_online_set_voice(i==0);}
-     if(is_focus(row))rline(x+8,cy,COLW-16,38,10,2,ACCENT);
-     if(pass==PASS_ACT&&(ev_adjust==row||(stick_mode&&ev_click==row)))tc2_online_set_voice(!on);
-     next_row();}
+    const char *key=H&&H->talk_key?H->talk_key:"STICK CLICK";
+    /* open mic / push to talk / off */
+    {static const char *const modes[]={"OPEN MIC","PUSH TO TALK","OFF"};
+     char tip[200];snprintf(tip,sizeof tip,"OPEN MIC sends when you speak. PUSH TO TALK sends while you hold %s%s. Echo and noise are filtered.",
+                            key,strcmp(key,"V")?" (V on a PC)":"");
+     const int mode=!on?2:V.push_to_talk?1:0;
+     const int m=box_choice(K_VOICE,x,cy,"Voice chat",modes,3,mode,tip);
+     if(m>=0&&m!=mode){if(m==2)tc2_online_set_voice(false);else{if(m==1)tc2_online_set_push_to_talk(true);else tc2_online_set_push_to_talk(false);if(!on)tc2_online_set_voice(true);}}}
     cy+=38;
     if(on){
         text(UI_M20,x+20,mid(UI_M20,cy,38),"You",MUTED);
         const float r=x+COLW-20;
         if(V.mic_denied)text_fit(UI_B20,r-200,mid(UI_B20,cy,38),200,"NO MIC",WARN,2);
-        else{
+        else if(V.push_to_talk){
+            char hold[48];snprintf(hold,sizeof hold,V.talking?"TALKING":"hold %s",key);
+            text_fit(V.talking?UI_B20:UI_M17,r-108-230,mid(V.talking?UI_B20:UI_M17,cy,38),220,hold,V.talking?GOOD:MUTED,2);
+            meter(r,cy,V.talking?V.level:0,GOOD);
+        }else{
             const int id=ID(K_ON,ON_MUTE);const char *l=V.muted?"UNMUTE":"MUTE";
             if(button(id,r-96,cy+4,96,30,l,UI_B16,V.muted?1:2,"Mute or unmute your microphone. In game: left stick click."))tc2_online_toggle_mute();
             focusable(id,F_BUTTON,(int)(r-48));next_row();
             if(V.muted)text_fit(UI_B20,r-300,mid(UI_B20,cy,38),190,"MUTED",WARN,2);else meter(r-108,cy,V.level,GOOD);
         }
         cy+=38;
-        text(UI_M20,x+20,mid(UI_M20,cy,38),"Partner",MUTED);
-        if(V.state==TC2V_LINKED&&!V.partner_voice)text_fit(UI_M17,x+COLW-320,mid(UI_M17,cy,38),300,"their game has no voice chat",MUTED,2);
-        else if(V.state==TC2V_LINKED||V.state==TC2V_RECONNECTING)meter(x+COLW-20,cy,V.partner_level,GOOD);
-        else text_fit(UI_M20,x+COLW-120,mid(UI_M20,cy,38),100,"-",DIM,2);
-        cy+=38;
+        if(partner){
+            text(UI_M20,x+20,mid(UI_M20,cy,38),"Partner",MUTED);
+            if(V.state==TC2V_LINKED&&!V.partner_voice)text_fit(UI_M17,x+COLW-320,mid(UI_M17,cy,38),300,"their game has no voice chat",MUTED,2);
+            else meter(x+COLW-20,cy,V.partner_level,GOOD);
+            cy+=38;
+        }
         const int row=ID(K_VOLROW,0);
         text(UI_M20,x+20,mid(UI_M20,cy,38),"Partner volume",MUTED);
         hit(row,(int)x,(int)cy,(int)COLW-170,38);focusable(row,F_SLIDER,(int)(x+COLW/2));say_help(row,"How loud your partner is.");
@@ -485,7 +513,7 @@ static void online_offline(void){
     /* right column: you, voice */
     frow=1;   /* the right column's rows sit beside the left's: up / down walks each column */
     float ry=CY0;const bool p2=V.home_side==2;
-    const float h=52+2*38+(p2?23:0);
+    const float h=52+3*38+(p2?23:0);
     float cy=box(COL2,ry,COLW,h,"YOU",MUTED,LINE);
     text(UI_M20,COL2+20,mid(UI_M20,cy,38),"Name",MUTED);
     {const int id=ID(K_ON,ON_NAME);const float bx=COL2+COLW-20-96;
@@ -493,7 +521,11 @@ static void online_offline(void){
      if(button(id,bx,cy+4,96,30,"CHANGE",UI_B16,2,"Your name in the lobby and on your partner's menu.")){modal=M_NAME;snprintf(kbuf,sizeof kbuf,"%s",V.name);focus=ID(K_KEY,0);}
      focusable(id,F_BUTTON,(int)bx+48);next_row();}
     kv(COL2+20,cy+38,COLW-40,"Solo cabinet",p2?"P2 \xC2\xB7 ROBERT":"P1 \xC2\xB7 KEITH",TEXT);
-    if(p2)para(UI_M15,COL2+20,cy+76+16,COLW-40,21,"Hosting makes you P1 for the session.",ACCENT,1);
+    {static const char *const onoff[]={"ON","OFF"};
+     const int c=box_choice(K_CREDIT,COL2,cy+76,"Join with a credit",onoff,2,V.join_credit?0:1,
+                            "Joining a game as P2, one credit goes in for you. Continues still take your own coins.");
+     if(c>=0)tc2_online_set_join_credit(c==0);}
+    if(p2)para(UI_M15,COL2+20,cy+114+16,COLW-40,21,"Hosting makes you P1 for the session.",ACCENT,1);
     ry+=h+8;
     voice_box(COL2,ry,"VOICE CHAT");
 }
@@ -747,6 +779,7 @@ static void layout(int which){
     if(tab==QMENU_TAB_GUN)settings(GUN_ROWS,sizeof GUN_ROWS/sizeof *GUN_ROWS);
     else if(tab==QMENU_TAB_PLAYER)settings(PLAYER_ROWS,sizeof PLAYER_ROWS/sizeof *PLAYER_ROWS);
     else if(tab==QMENU_TAB_GRAPHICS)settings(GRAPHICS_ROWS,sizeof GRAPHICS_ROWS/sizeof *GRAPHICS_ROWS);
+    else if(tab==QMENU_TAB_AUDIO)settings(AUDIO_ROWS,sizeof AUDIO_ROWS/sizeof *AUDIO_ROWS);
     else online_tab();
     if(drawing())qc_unclip(&cv);
     frow=1000;footer();
@@ -893,8 +926,8 @@ bool qmenu_render(const QMenuHost *host,uint8_t *pixels,double now,int dirty[4])
     s.tab=tab;s.screen=screen;s.page=page;s.modal=modal;s.stick=stick_mode;
     memcpy(s.kbuf,kbuf,sizeof s.kbuf);for(int i=0;i<QOPT_COUNT;i++)s.opt[i]=H->get(i);
     s.boot_p=H->boot_player;s.boot_r=H->boot_resolution;s.aw=H->active_w;s.ah=H->active_h;s.unsup=H->preset_unsupported;s.saved=H->saved;
-    tc2_online_view v=V;const int live[]={v.level,v.partner_level,v.ping_ms/10,v.gone_s,v.link_alive,v.link_lagging};
-    v.level=v.partner_level=v.ping_ms=v.gone_s=0;v.link_alive=v.link_lagging=false;
+    tc2_online_view v=V;const int live[]={v.level,v.partner_level,v.ping_ms/10,v.gone_s,v.link_alive,v.link_lagging,v.talking};
+    v.level=v.partner_level=v.ping_ms=v.gone_s=0;v.link_alive=v.link_lagging=v.talking=false;
     uint32_t h=mix(2166136261u,&s,sizeof s);h=mix(h,&v,sizeof v);h=mix(h,games,sizeof games[0]*game_count);h=mix(h,&game_count,sizeof game_count);
     const int point[3]={stick_mode?0:hover,pressed,stick_mode?focus:0};
     uint32_t p=mix(2166136261u,point,sizeof point);p=mix(p,help,strlen(help));

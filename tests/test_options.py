@@ -26,12 +26,12 @@ P=C.c_void_p;I=C.c_int;U=C.c_uint
 def bind(lib,name,result,*args):
     f=getattr(lib,name);f.restype=result;f.argtypes=args;return f
 class Options(C.Structure):
-    _fields_=[('laser_enabled',C.c_bool),('physical_crouch',C.c_bool),('left_handed',C.c_bool),('gun_pitch',C.c_int),('world_scale',C.c_int),('view_distance',C.c_int),('tracer_enabled',C.c_bool),('gun_offset_y_mm',C.c_int),('gun_offset_z_mm',C.c_int),('player_side',C.c_int),('texture_filtering',C.c_bool),('resolution',C.c_int)]
+    _fields_=[('laser_enabled',C.c_bool),('physical_crouch',C.c_bool),('left_handed',C.c_bool),('gun_pitch',C.c_int),('world_scale',C.c_int),('view_distance',C.c_int),('tracer_enabled',C.c_bool),('gun_offset_y_mm',C.c_int),('gun_offset_z_mm',C.c_int),('player_side',C.c_int),('texture_filtering',C.c_bool),('resolution',C.c_int),('game_volume',C.c_int),('skip_startup',C.c_bool)]
 class Cover(C.Structure):
     _fields_=[('upright_y',C.c_float),('calibrated',C.c_bool),('ducked',C.c_bool)]
 load=bind(lib,'qoptions_load',None,C.c_char_p,C.POINTER(Options));save=bind(lib,'qoptions_save',C.c_bool,C.c_char_p,C.POINTER(Options))
 def read_options(path,full=False):
-    result=Options();load(path,C.byref(result));return tuple(getattr(result,k) for k,_ in (Options._fields_[:-2] if full else Options._fields_[:6]))
+    result=Options();load(path,C.byref(result));return tuple(getattr(result,k) for k,_ in (Options._fields_[:10] if full else Options._fields_[:6]))
 with tempfile.TemporaryDirectory(prefix='tcvr-options-') as tmp:
     config=Path(tmp)/'quest-options.cfg';path=str(config).encode()
     def filtering():
@@ -92,6 +92,17 @@ with tempfile.TemporaryDirectory(prefix='tcvr-options-') as tmp:
             config.write_text(''.join(f'{k}={invalid if k==key else 1}\n' for k in keys))
             expected=[True]*3;expected[index]=index==0
             assert read_options(path)==(*expected,0,100,0)
+    def skip_startup():
+        result=Options();load(path,C.byref(result));return result.skip_startup
+    config.unlink();assert not skip_startup(),'Skipping the start-up is off by default'
+    for old in ('', 'laser_enabled=0\nworld_scale=125\n'):
+        config.write_text(old);assert not skip_startup(),'Old configs keep the start-up'
+    for invalid in ('2','-1','1junk','nan',''):
+        config.write_text('skip_startup='+invalid+'\n');assert not skip_startup(),invalid
+    for on in (True,False,True):
+        config.write_text('skip_startup='+str(int(on))+'  \nworld_scale=150\n')
+        options=Options();load(path,C.byref(options));assert options.skip_startup==on and options.world_scale==150
+        assert save(path,C.byref(options));assert skip_startup()==on
     assert not save(str(Path(tmp)/'missing/options.cfg').encode(),C.byref(Options(True,True))),'Write failure must be reported'
 calibrate=bind(lib,'qcover_calibrate',None,C.POINTER(Cover),C.c_float)
 pedal=bind(lib,'qcover_pedal',C.c_bool,C.POINTER(Cover),C.c_float,C.c_bool)
@@ -112,11 +123,13 @@ attributes=(I*13)(0x3033,1,0x3040,0x40,0x3024,8,0x3023,8,0x3022,8,0x3021,8,0x303
 config=P();count=I();assert bind(egl,'eglChooseConfig',U,P,P,P,I,P)(display,attributes,C.byref(config),1,C.byref(count)) and count.value
 current=bind(egl,'eglMakeCurrent',U,P,P,P,P);render=bind(lib,'options_fixture',I,I,I,I,P)
 images=[];w=h=800
-for variant in range(8):
+for variant in range(10):
     surface=bind(egl,'eglCreatePbufferSurface',P,P,P,P)(display,config,(I*5)(0x3057,w,0x3056,h,0x3038))
     context=bind(egl,'eglCreateContext',P,P,P,P,P)(display,config,None,(I*3)(0x3098,3,0x3038));assert surface and context and current(display,surface,surface,context)
     pixels=(C.c_ubyte*(w*h*4))();status=render(variant,w,h,pixels);assert status==1,(variant,status)
-    image=Image.frombytes('RGBA',(w,h),bytes(pixels)).transpose(Image.Transpose.FLIP_TOP_BOTTOM).convert('RGB');images.append(image)
+    rgba=Image.frombytes('RGBA',(w,h),bytes(pixels)).transpose(Image.Transpose.FLIP_TOP_BOTTOM);image=rgba.convert('RGB');images.append(image)
+    if variant==8:alpha8=rgba.getchannel('A')
+    if variant==9:copy9=rgba
     assert sum(p!=image.getpixel((0,0)) for p in image.get_flattened_data())>10000
     image.save(ROOT/f'artifacts/menu-preview-{variant}.png')
     current(display,None,None,None);bind(egl,'eglDestroyContext',U,P,P)(display,context);bind(egl,'eglDestroySurface',U,P,P)(display,surface)
@@ -125,5 +138,10 @@ assert images[2].tobytes()==images[3].tobytes(),'A changed value must refresh th
 assert images[0].tobytes()!=images[3].tobytes(),'Gun angle values must be visible'
 assert len({im.tobytes() for im in (images[0],images[4],images[5],images[6])})==4,'Every tab must look different'
 assert images[0].tobytes()!=images[7].tobytes(),'Save errors must be visible'
+# the menu layer (quest_host.c): the picture keeps its colours (mirror, screenshots) and lets the layer through under the panel
+assert images[8].tobytes()==images[0].tobytes(),"An underlay must leave the picture's colours as they were"
+assert alpha8.getpixel((w//2,h//2))==0 and alpha8.getpixel((5,5))==255,"The picture's alpha: 0 under the panel, 1 elsewhere"
+assert copy9.getpixel((w//2,h//2))[3]==255 and copy9.getpixel((0,0))[3]<128,'The layer copy: opaque panel, clear rounded corners'
+assert copy9.convert('RGB').tobytes()!=copy9.convert('RGB').transpose(Image.Transpose.FLIP_TOP_BOTTOM).tobytes(),'The layer copy must have a top and bottom'
 bind(egl,'eglTerminate',U,P)(display)
 print('PASS: saved angle/option combinations, old-config migration, malformed settings, cover traces; the GLES menu panel: stereo, texture refresh, every tab, save errors; no GL errors.')

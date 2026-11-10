@@ -58,6 +58,13 @@ static void rejoin_tick(void);
 #define COINS_AFTER_RESTART 40             /* coins 30 frames after a TEST restart counted (measured 2026-11-08) */
 #define MENU_TIMEOUT_LEAD 30               /* frames before SELECT GAME MODE would choose by itself that the restart begins */
 #define LINK_INIT_FRAMES 880               /* the game shakes hands on its link ~920 frames after power-on (measured) */
+/* The arcade's own start-up (measured 2026-11-10): after power-on the memory test (to ~650), the link countdown (~660-930), the
+ * parental advisory and the logo, black from ~1380 and the attract at ~1440; after a TEST restart the test menu, the advisory and
+ * the logo, black from ~+460 and the attract at ~+490. A shot in it runs the arcade faster (quest_host.c, skip_update). */
+#define STARTUP_POWER_ON 1380
+#define STARTUP_TEST 460
+#define STARTUP_HINT "SHOOT TO SKIP THE START-UP"
+static void startup_hint_tick(void);
 static void session_end(void);
 static int  frame_out(uint8_t *buf);
 static void frame_in(int slot,const uint8_t *buf,uint32_t seq);
@@ -100,11 +107,11 @@ static bool last_seen;                     /* the server listed the room since i
 #define REJOIN_HOURS 12                    /* an older memory is dropped at start, whatever the server says */
 
 /* ---- config ---- */
-static bool cfg_voice=true,cfg_muted=false;static int cfg_volume=100;
+static bool cfg_voice=true,cfg_muted=false,cfg_ptt=false,cfg_join_credit=true;static int cfg_volume=100;
 static void save_cfg(void){
     FILE *f=fopen(CFG_PATH,"w");if(!f)return;
-    fprintf(f,"name=%s\nserver=%s\njoin=%u.%u.%u.%u:%d\nvoice=%d\nmic_muted=%d\nvoice_volume=%d\n",name,server,
-            join_ip[0],join_ip[1],join_ip[2],join_ip[3],join_port,cfg_voice?1:0,cfg_muted?1:0,cfg_volume);
+    fprintf(f,"name=%s\nserver=%s\njoin=%u.%u.%u.%u:%d\nvoice=%d\nmic_muted=%d\nvoice_volume=%d\npush_to_talk=%d\njoin_credit=%d\n",name,server,
+            join_ip[0],join_ip[1],join_ip[2],join_ip[3],join_port,cfg_voice?1:0,cfg_muted?1:0,cfg_volume,cfg_ptt?1:0,cfg_join_credit?1:0);
     if(last_room_id>0)fprintf(f,"rejoin=%d %s %d %lld %s\n",last_room_id,last_code,last_side,last_time,last_partner);
     fclose(f);
 }
@@ -127,6 +134,8 @@ static void load_cfg(void){
             if(sscanf(line+5,"%u.%u.%u.%u:%d",&a,&b,&c,&d,&p)>=4&&a<256&&b<256&&c<256&&d<256){join_ip[0]=a;join_ip[1]=b;join_ip[2]=c;join_ip[3]=d;join_port=p>0&&p<65536?p:27750;}}
         else if(!strncmp(line,"voice=",6))cfg_voice=atoi(line+6)!=0;
         else if(!strncmp(line,"mic_muted=",10))cfg_muted=atoi(line+10)!=0;
+        else if(!strncmp(line,"push_to_talk=",13))cfg_ptt=atoi(line+13)!=0;
+        else if(!strncmp(line,"join_credit=",12))cfg_join_credit=atoi(line+12)!=0;
         else if(!strncmp(line,"voice_volume=",13)){cfg_volume=atoi(line+13);if(cfg_volume<0)cfg_volume=0;if(cfg_volume>200)cfg_volume=200;}
         else if(!strncmp(line,"rejoin=",7)){
             int id=0,side=0;char code[8]={0},who[32]={0};long long when=0;
@@ -139,7 +148,7 @@ static void load_cfg(void){
     }
     fclose(f);
 }
-static void apply_voice_cfg(void){tc2_voice_set_enabled(cfg_voice);tc2_voice_set_muted(cfg_muted);tc2_voice_set_volume(cfg_volume);}
+static void apply_voice_cfg(void){tc2_voice_set_enabled(cfg_voice);tc2_voice_set_muted(cfg_muted);tc2_voice_set_volume(cfg_volume);tc2_voice_set_push_to_talk(cfg_ptt);}
 
 /* ---- local addresses (shown while hosting so the partner knows what to type) ---- */
 static char addresses[3][20];static int address_count;
@@ -539,8 +548,12 @@ static void standin_tick(void){
         return;
     }
     const bool partner=eng_net_session_active();
+    /* Between two sessions the partner is still in the room (the server's session limit, 15 minutes on the public server, ends a
+     * session and the next starts a few frames later), and their game may still be running after ours ended: the stand-in must
+     * not take their place, or our arcade sees the right cabinet go idle and come back (measured 2026-11-09, p1over). */
+    const bool partner_here=episode&&eng_net_connected()&&eng_net_roster_count()>=2;
     /* from power-on, and after a partner left once a game is over (mid-game the arcade still expects that partner back) */
-    const bool want=!off&&qtc2_cabinet_side==1&&!partner&&(game_mode==0||(!episode&&host_waiting()));
+    const bool want=!off&&qtc2_cabinet_side==1&&!partner&&!partner_here&&(game_mode==0||(!episode&&host_waiting()));
     if(want&&!tc2_link_ghost()){tc2_link_set_ghost(true);fprintf(stderr,"[ONLINE] frame %u: drop-in open: the stand-in answers until a partner links\n",sim_frames);}
     else if(tc2_link_ghost()&&!partner&&(off||qtc2_cabinet_side!=1))tc2_link_set_ghost(false);
     /* SOLO/LINKED taken with nobody online yet: a room opens for this game, and a friend joins it any time */
@@ -594,7 +607,7 @@ static bool holding;                       /* the agreed start (below) */
  * TC2_NET_SCRIPT="<frame>:<action>[=arg];..." (or t<ms>: milliseconds after start, for a headset nobody wears). Actions: host
  * (LAN), join=<addr>, discover, quick, hostroom, joincode=<code>, browse, pickroom, rejoin, restart, mute, voice=0|1, leave,
  * freeze=<ms> (the whole app stalls, as a backgrounded headset does), and the menu's (quest_host.c qhost_test): menu=<tab>,
- * resume, restartgame, restartapp. The menu path runs exactly as a player's selection would.
+ * resume, restartgame, restartapp, and skip (the shot that skips the start-up). The menu path runs exactly as a player's selection would.
  * On a headset there is no environment: online-test.txt beside the settings (adb run-as on this debuggable build) may hold
  * "script=<as TC2_NET_SCRIPT>" and "status=1". */
 static void test_file(int *status,const char **script){
@@ -609,7 +622,7 @@ static void test_file(int *status,const char **script){
     }
     fclose(f);fprintf(stderr,"[ONLINE] online-test.txt: script '%s'\n",*script?*script:"");
 }
-static int test_status=-1;static const char *test_script;static uint32_t test_t0,test_last_ms;
+static int test_status=-1;static const char *test_script;static uint32_t test_t0,test_last_ms;static bool test_talk;
 static void test_switches_at(bool timed){
     if(test_status<0){test_status=getenv("TC2_NET_STATUS")!=NULL;test_script=getenv("TC2_NET_SCRIPT");test_file(&test_status,&test_script);test_t0=SDL_GetTicks();}
     uint32_t now=SDL_GetTicks()-test_t0,since=test_last_ms;if(timed)test_last_ms=now;
@@ -637,10 +650,11 @@ static void test_switches_at(bool timed){
         else if(!strcmp(action,"rejoin"))tc2_online_rejoin();
         else if(!strcmp(action,"restart"))tc2_online_restart_game();
         else if(!strcmp(action,"mute"))tc2_online_toggle_mute();
+        else if(!strcmp(action,"talk")&&arg)test_talk=atoi(arg)!=0;     /* push to talk: the key held (1) or let go (0) */
         else if(!strcmp(action,"voice")&&arg){cfg_voice=atoi(arg)!=0;apply_voice_cfg();}
         else if(!strcmp(action,"leave"))leave();
         else if(!strcmp(action,"freeze")&&arg)SDL_Delay((Uint32)atoi(arg));
-        else{extern void qhost_test(const char *action,const char *arg);qhost_test(action,arg);}   /* menu, resume, restartgame, restartapp */
+        else{extern void qhost_test(const char *action,const char *arg);qhost_test(action,arg);}   /* menu, resume, restartgame, restartapp, skip */
     }
     if(!timed&&test_status&&sim_frames%300==0){
         tc2_link_status s;tc2_link_get_status(&s);char net[96];eng_net_status(net,sizeof net);
@@ -654,11 +668,24 @@ static void test_switches_at(bool timed){
     }
 }
 
-/* link health warnings over the game */
+static uint32_t hold_start_ms,holds,held_ms,held_max_ms;   /* hitches (tc2_online_may_advance) */
+/* link health warnings over the game, and a line in the log: every 30 s while linked, and at once (at most every 2 s) when link
+ * frames go missing or the game counts link errors -- so a game that goes wrong online (two cabinets disagreeing) leaves a trace */
 static void health_tick(void){
     static uint32_t bad_since,warned;
     if(!eng_net_session_active())return;
     tc2_link_status s;tc2_link_get_status(&s);
+    {   static uint32_t last_ms,seen;extern uint8_t tc2_ram[];
+        const uint32_t now=SDL_GetTicks(),trouble=s.rx_skipped+s.rx_bad+s.tx_bad+s.game_errors;
+        if((trouble!=seen&&now-last_ms>=2000)||now-last_ms>=30000){
+            fprintf(stderr,"[LINKHEALTH] frame %u P%d lag %u state %u tx %u rx %u skipped %u dropped %u bad %u/%u game-errors %u ping %d partner-state %d self %d"
+                    " | holds %u held %u ms longest %u ms\n",
+                    sim_frames,qtc2_cabinet_side,s.lag,s.state,s.tx,s.rx,s.rx_skipped,s.rx_dropped,s.tx_bad,s.rx_bad,s.game_errors,eng_net_ping_ms(),
+                    tc2_ram[0x2F3502],tc2_link_self_state(),holds,held_ms,held_max_ms);
+            holds=held_ms=held_max_ms=0;   /* the pauses since the last line */
+            last_ms=now;seen=trouble;
+        }
+    }
     uint32_t now=SDL_GetTicks();
     if(s.lag>6&&s.alive){if(!bad_since)bad_since=now;}else bad_since=0;
     if(bad_since&&now-bad_since>1500&&now-warned>8000){say("PARTNER CONNECTION IS LAGGING",3000);warned=now;}
@@ -672,7 +699,11 @@ static void health_tick(void){
  * way; credited first, or within ~6 s, the right shows its partner as "COM" and its score freezes. So the right cabinet's coin,
  * trigger and pedal are held until it is in a game, while the left has not been in its game for TC2_JOIN_WAIT frames (1500 = 25 s,
  * or the same in wall-clock time over a slow link). Coins put in meanwhile are counted and paid in afterwards, 4 frames on and 36
- * off each. The right cabinet learns its own state from the left's trailer; without one (unknown), nothing is held. ---- */
+ * off each. The right cabinet learns its own state from the left's trailer; without one (unknown), nothing is held.
+ * Once the left has played a game in this episode, the hold applies only while it starts another (credited, or in a game younger
+ * than the wait): with the left in attract after its game over, the right plays on by itself, continues and starts again, as the
+ * arcade's right cabinet does when the left player walks away. (Held, a P2 whose partner had stopped could not continue: its coins
+ * waited for a left game that never came.) Before the left's first game the right still waits for it, as upstream measured. ---- */
 static bool holding;static int coin_pending,coin_pulse,coin_fast,prev_coin;static uint32_t p_since,p_since_ms;static int p_prev=-1;
 static void start_hold_tick(void){
     extern uint8_t tc2_ram[];extern uint16_t tc2_inputs;extern uint32_t rr_frame;
@@ -681,7 +712,9 @@ static void start_hold_tick(void){
     if(pst!=p_prev){p_prev=pst;p_since=rr_frame;p_since_ms=SDL_GetTicks();}
     const uint32_t left_ms=(uint32_t)(wait*1000/60),in_ms=SDL_GetTicks()-p_since_ms;
     const bool left_done=pst==4&&(rr_frame-p_since>=(uint32_t)wait||in_ms>=left_ms||tc2_link_partner_mark()=='J');
-    bool h=eng_net_session_active()&&eng_net_slot()==1&&self>=0&&self!=4&&!left_done;
+    static bool left_played;if(!episode)left_played=false;else if(pst==4)left_played=true;
+    const bool left_starting=pst==2||(pst==4&&!left_done);
+    bool h=eng_net_session_active()&&qtc2_cabinet_side==2&&!side_pending&&self>=0&&self!=4&&(left_played?left_starting:!left_done);
     const int c=tc2_inputs&0x0001;                       /* the raw coin, before the hold (tc2_h8.c reads it through tc2_link_hold_start) */
     if(h&&c&&!prev_coin)coin_pending++;
     prev_coin=c;
@@ -700,6 +733,26 @@ static void start_hold_tick(void){
         char t[48];uint32_t r=in_ms<left_ms?(left_ms-in_ms+999)/1000:0;
         snprintf(t,sizeof t,"P1 IS STARTING - YOU JOIN IN %u S",(unsigned)r);say(t,2500);
     }
+}
+/* ---- a credit to join with (the ONLINE tab's "Join with a credit", on by default) ----
+ * Each cabinet keeps its own coins, so a P2 who linked into P1's game without putting coins in stood in attract, watching. Once a
+ * session, when P1 is in a game and this right cabinet is not, its link handshake is done and it holds less than a credit, the
+ * coins for one credit go in (paid as the coin mech's, after the agreed-start hold, like any held coin). Continues still take the
+ * player's own coins, so one credit stays one credit. */
+static bool credit_given;
+static void credit_tick(void){
+    extern uint8_t tc2_ram[];
+    if(!episode){credit_given=false;return;}
+    if(!cfg_join_credit||credit_given||!eng_net_session_active()||qtc2_cabinet_side!=2||side_pending)return;
+    if(p2_init_pending||mode_restart||repay||sim_frames-init_frame<LINK_INIT_FRAMES+180)return;
+    if(tc2_ram[0x2F3502]!=4||tc2_link_self_state()!=1)return;      /* P1 in a game, this cabinet in attract */
+    if(tc2_link_partner_mark()=='L')return;                         /* P1 plays SOLO ONLY: wait for a game P2 can join */
+    const int short_by=coin_cost-tc2_ram[0x2CE7B7]-coin_pending;
+    credit_given=true;
+    if(short_by<=0)return;
+    coin_pending+=short_by;coin_fast+=short_by;
+    fprintf(stderr,"[ONLINE] frame %u: a credit to join with: %d coins in\n",sim_frames,short_by);
+    say("A CREDIT TO JOIN WITH - PULL THE TRIGGER",5000);
 }
 /* The coins a drop-in restart cleared, paid in as the held ones are once attract is back and the room is open (or could not
  * open): the last one completes the credit and SELECT GAME MODE comes up by itself, now with SOLO/LINKED. */
@@ -728,11 +781,23 @@ int tc2_link_hold_start(void){return holding;}
 int tc2_link_coin_inject(void){return coin_pulse>0;}
 /* stall-and-wait, as upstream: neither cabinet runs more than a few frames ahead of the other. The VR host asks before each
  * arcade frame and keeps rendering the headset meanwhile (upstream blocks in eng_net_wait; a headset must not). */
+/* hitches: the arcade held waiting for the partner's frames (stall-and-wait), counted for [LINKHEALTH] */
+static void hold_end(void){
+    if(!hold_start_ms)return;
+    const uint32_t d=SDL_GetTicks()-hold_start_ms;hold_start_ms=0;
+    if(d>=20){holds++;held_ms+=d;if(d>held_max_ms)held_max_ms=d;}   /* a frame or more of waiting */
+}
 bool tc2_online_may_advance(void){
-    if(!inited||!eng_net_session_active())return true;
+    if(!inited||!eng_net_session_active()){hold_end();return true;}
     static int lead=-2;if(lead==-2){const char *e=getenv("TC2_NET_LEAD");lead=e?atoi(e):-1;}
     if(lead>=1000)return true;
-    if(eng_net_may_advance(lead<0?eng_net_auto_lead():lead,1000))return true;
+    /* How far ahead of the partner's newest frame the arcade may run. Upstream's auto lead (2 frames + the round trip) holds the
+     * game at every Wi-Fi jitter spike over it: measured with 5% loss and 150 ms jitter (badnet), 26-28 pauses (about 2 s) in a
+     * minute and a half. 6 frames more, up to 12 in all, cut that to 1-9 pauses with the game's own link lag at most 7 frames, no
+     * link loss and no game errors (it declares the link lost near 17). A slow link whose auto lead is already over 12 keeps it. */
+    int ahead=lead;if(ahead<0){const int a=eng_net_auto_lead();ahead=a+6>12?(a>12?a:12):a+6;}
+    if(eng_net_may_advance(ahead,1000)){hold_end();return true;}
+    if(!hold_start_ms)hold_start_ms=SDL_GetTicks()|1;
     eng_net_poll_paused();
     return false;
 }
@@ -748,6 +813,7 @@ void tc2_online_frame(void){
     eng_net_poll();
     start_hold_tick();
     coins_tick();
+    credit_tick();
     menu_timeout_tick();
     standin_tick();
     link_contact_tick();
@@ -759,6 +825,7 @@ void tc2_online_frame(void){
     browse_tick();
     health_tick();
     side_tick();
+    startup_hint_tick();
     last_poll_ms=SDL_GetTicks();
 }
 void tc2_online_service(void){
@@ -780,6 +847,7 @@ void tc2_online_service(void){
 /* ---- the pause menu's ONLINE tab (quest_menu.c): a view of the state above, and the player's actions ---- */
 static void set_voice(bool on){cfg_voice=on;apply_voice_cfg();save_cfg();say(on?"VOICE CHAT ON":"VOICE CHAT OFF",2000);}
 static void set_volume(int v){cfg_volume=v<0?0:v>200?200:v;tc2_voice_set_volume(cfg_volume);save_cfg();}
+static void set_push_to_talk(bool on){cfg_ptt=on;apply_voice_cfg();save_cfg();}
 static bool connected_any(void){return eng_net_hosting()||eng_net_connected()||mode!=MODE_NONE||episode;}
 
 /* REJOIN: the room the player left (or restarted out of) while linked, offered for as long as the server still lists it */
@@ -808,13 +876,14 @@ void tc2_online_menu_shown(bool online_tab){if(online_tab){menu_online=true;menu
 
 void tc2_online_get_view(tc2_online_view *v){
     memset(v,0,sizeof *v);
-    v->side=qtc2_cabinet_side;v->home_side=home_side;v->ping_ms=-1;v->volume=cfg_volume;v->voice=cfg_voice;v->muted=cfg_muted;
+    v->side=qtc2_cabinet_side;v->home_side=home_side;v->ping_ms=-1;v->volume=cfg_volume;v->voice=cfg_voice;v->muted=cfg_muted&&!cfg_ptt;
+    v->push_to_talk=cfg_ptt;v->join_credit=cfg_join_credit;
     snprintf(v->name,sizeof v->name,"%s",name);snprintf(v->server,sizeof v->server,"%s",server);
     snprintf(v->join_ip,sizeof v->join_ip,"%u.%u.%u.%u",join_ip[0],join_ip[1],join_ip[2],join_ip[3]);
     if(!inited)return;
     tc2_voice_status vs;tc2_voice_get_status(&vs);
     v->mic_denied=vs.mic_denied;v->partner_voice=vs.partner_has_voice;
-    v->level=cfg_muted?0:vs.level/350>8?8:vs.level/350;v->partner_level=vs.partner_level*3/350>8?8:vs.partner_level*3/350;
+    v->level=v->muted?0:vs.level/350>8?8:vs.level/350;v->talking=vs.talking;v->partner_level=vs.partner_level*3/350>8?8:vs.partner_level*3/350;
     if(episode)v->state=eng_net_session_active()?TC2V_LINKED:TC2V_RECONNECTING;
     else if(pending_code[0]){v->state=TC2V_JOINING;snprintf(v->joining,sizeof v->joining,"%s",pending_code);snprintf(v->code,sizeof v->code,"%s",pending_code);}
     else if(mode==MODE_LAN_HOST&&eng_net_hosting())v->state=TC2V_LAN_HOSTING;
@@ -897,6 +966,10 @@ void tc2_online_join_ip(void){
     forget_room();join_address(a);
 }
 void tc2_online_set_voice(bool on){if(inited)set_voice(on);}
+void tc2_online_set_push_to_talk(bool on){if(inited)set_push_to_talk(on);}
+void tc2_online_set_join_credit(bool on){if(inited){cfg_join_credit=on;save_cfg();}}
+bool tc2_online_push_to_talk(void){return inited&&cfg_voice&&cfg_ptt;}
+void tc2_online_talk_key(bool held){if(inited)tc2_voice_talk_key(cfg_ptt&&(held||test_talk));}
 void tc2_online_set_volume(int percent){if(inited)set_volume(percent);}
 void tc2_online_set_name(const char *n){
     if(!inited)return;
@@ -917,6 +990,22 @@ void tc2_online_restart_game(void){
     mode_restart=MODE_RESTART_FRAMES;init_frame=sim_frames;
     fprintf(stderr,"[ONLINE] frame %u: RESTART GAME from the menu (TEST), %d coins paid back after\n",sim_frames,repay);
     say(repay?"THE ARCADE RESTARTS - YOUR COINS ARE KEPT":"THE ARCADE RESTARTS",5000);
+}
+
+/* The arcade's own start-up, which a shot may skip (quest_host.c) when the player turned it on: not while linked (both arcades run in lockstep), and not once
+ * coins are in or a game runs (the arcade is the player's then). Skipping only runs the same frames sooner. */
+static bool startup_skip;
+void tc2_online_set_startup_skip(bool on){startup_skip=on;}
+int tc2_online_startup_left(void){
+    extern uint8_t tc2_ram[];
+    if(!startup_skip||!inited||tc2_online_session()||tc2_ram[0x2CE7B7]||tc2_ram[0x2F3FD3])return 0;
+    uint32_t end=STARTUP_POWER_ON;   /* TEST in the power-on test does not shorten it (measured) */
+    if(init_frame&&init_frame+STARTUP_TEST>end)end=init_frame+STARTUP_TEST;
+    return sim_frames<end?(int)(end-sim_frames):0;
+}
+void tc2_online_startup_skipping(void){if(!strcmp(toast,STARTUP_HINT))toast[0]=0;}
+static void startup_hint_tick(void){   /* after power-on, once the picture is up, unless another message shows */
+    if(sim_frames==60&&tc2_online_startup_left()>0&&!tc2_online_toast(NULL,0,NULL))say(STARTUP_HINT,6000);
 }
 
 bool tc2_online_toast(char *text,size_t n,unsigned *serial){
